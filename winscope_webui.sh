@@ -167,9 +167,9 @@ if ! printf '%s\n' "$adb_output" | grep -E '^[^[:space:]]+[[:space:]]+device[[:s
     device_hint='未检测到已授权设备，请检查 adb devices -l。'
 fi
 
-printf '\n========================================\n'
-printf 'Winscope Web UI 已启动\n'
-printf '========================================\n'
+printf '\n=============================================\n'
+printf 'Winscope Web UI 已启动，按 Ctrl+C 停止服务\n'
+printf '=============================================\n'
 printf 'UI:         http://127.0.0.1:%s\n' "$ui_port"
 printf 'Proxy:      http://127.0.0.1:%s\n' "$proxy_port"
 printf 'Token:      %s\n' "$token"
@@ -177,7 +177,6 @@ printf 'Runtime:    %s\n' "$runtime_dir"
 if [[ -n "$device_hint" ]]; then
     printf '提示:       %s\n' "$device_hint"
 fi
-printf '\n按 Ctrl+C 停止服务\n'
 
 if [[ "$open_browser" == true ]] && command -v xdg-open >/dev/null 2>&1; then
     xdg-open "http://127.0.0.1:$ui_port" >/dev/null 2>&1 &
