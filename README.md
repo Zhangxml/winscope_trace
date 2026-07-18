@@ -16,7 +16,7 @@
 | 依赖 | 是否必须 | 用途 |
 | --- | --- | --- |
 | `bash` | 是 | 执行启动脚本。 |
-| `python3` | 是 | 启动本地 Web UI 静态文件服务和 Winscope Proxy。Python 标准库即可，无需安装第三方 Python 包。 |
+| `python3` 3.10+ | 是 | 启动本地 Web UI 静态文件服务和 Winscope Proxy。仅使用 Python 标准库，无需安装第三方 Python 包。 |
 | `adb` | 直接抓取时必须 | 查询 Android 设备、执行抓取与拉取 trace 文件。 |
 | 现代浏览器 | 是 | 打开 Winscope Web UI。推荐 Chrome 或 Chromium。 |
 | `xdg-open` | 否 | 自动打开浏览器；缺失时使用 `--no-browser` 后手动访问页面。 |
@@ -33,6 +33,8 @@
 - Android 构建环境。
 - Node.js、npm、yarn、pnpm。
 - Java、Gradle。
+
+启动脚本只检查 `python3` 命令是否存在；Proxy 会在启动时校验 Python 版本，低于 3.10 会直接退出。
 
 ## 目录结构
 
@@ -74,7 +76,13 @@ WINSCOPE_TOKEN_LOCATION=winscope-aosp/runtime/.token \
 python3 vendor/winscope-proxy/winscope_proxy.py -p 5544
 ```
 
-Proxy 同样只监听本机 IPv6 回环地址 `::1`。这是因为 AOSP 16 Winscope Web UI 固定访问 `http://localhost:5544`，而当前主机的 `localhost` 优先解析为 `::1`。Web UI 通过 Token 访问 Proxy，Proxy 再调用本机 `adb` 与设备交互。
+Proxy 只监听本机 IPv6 回环地址 `::1`。Winscope Web UI 通过 `http://localhost:<Proxy端口>` 访问 Proxy，Proxy 再调用本机 `adb` 与设备交互；服务不会对局域网暴露。
+
+当前启动脚本的 `Proxy:` 输出仍显示 `127.0.0.1`，但该地址不一定能直连 IPv6-only Proxy。手动填写 Proxy 地址时，应使用：
+
+```text
+http://localhost:5544
+```
 
 ### Trace 启停处理
 
@@ -88,7 +96,8 @@ TimeoutExpired(['adb', '-s', '<serial>', 'shell'], 15)
 
 1. 开始抓取时直接执行 Web UI 下发的 `startCmd`。
 2. 结束抓取时新建一次 `adb shell` 直接执行对应的 `stopCmd`。
-3. 对 adb 子进程超时显式捕获并作为 trace 错误返回，避免 Proxy 以 HTTP 500 中断。
+3. 对 trace 启停和文件拉取的 adb 子进程应用 15 秒超时；超时后终止 adb 子进程并返回明确错误，避免 Proxy 永久阻塞或以 HTTP 500 中断。
+4. 每个运行中的 trace 需要 Web UI 持续调用 `/status` 保活；连续 30 秒没有收到保活请求时，Proxy 自动执行该 trace 的 `stopCmd`。
 
 这样可确保 WindowManager trace、`screenrecord` 和 detached Perfetto session 在结束时执行真实的设备侧清理命令。
 
@@ -116,11 +125,11 @@ cd /path/to/winscope_trace
 ./winscope_webui.sh
 ```
 
-默认地址：
+脚本当前输出：
 
 ```text
 UI:         http://127.0.0.1:8080
-Proxy:      http://localhost:5544
+Proxy:      http://127.0.0.1:5544
 Token:      <随机 Token>
 Runtime:    /path/to/winscope_trace/winscope-aosp/runtime
 ```
@@ -132,7 +141,7 @@ Runtime:    /path/to/winscope_trace/winscope-aosp/runtime
 浏览器打开脚本输出的 UI 地址。首次进入 Winscope 后：
 
 1. 在连接类型中选择 `Winscope Proxy`。
-2. 填入 `Proxy`：`http://127.0.0.1:5544`。
+2. 填入 `Proxy`：`http://localhost:5544`。
 3. 填入终端输出的 `Token`。
 4. 选择显示的 adb 设备。
 5. 选择需要的 trace 类型并开始抓取。
@@ -156,7 +165,7 @@ Runtime:    /path/to/winscope_trace/winscope-aosp/runtime
 
 ```text
 UI:     http://127.0.0.1:18080
-Proxy:  http://127.0.0.1:15544
+Proxy:  http://localhost:15544
 ```
 
 ### 从其他目录启动
@@ -194,6 +203,12 @@ Ctrl+Shift+R
 ```
 
 或者确认之前启动的脚本已经通过 `Ctrl+C` 正常退出。
+
+### 文件拉取超时
+
+Proxy 对单次 trace 启停和文件拉取均使用 15 秒超时。设备在抓取结束后断连、USB/adb 半断连，或 `adb exec-out` 无响应时，当前 trace 会报告超时而不会无限卡住。
+
+重新连接设备后需要重新发起抓取；已经因设备退出而未拉取完成的 trace 文件无法从 Proxy 恢复。
 
 ### 未检测到已授权设备
 

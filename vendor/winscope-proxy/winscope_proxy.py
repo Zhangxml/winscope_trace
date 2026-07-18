@@ -264,7 +264,14 @@ class FetchEndpoint(DeviceRequestEndpoint):
         try:
             process = subprocess.Popen(['adb'] + ['-s', device] + params.split(' '), stdout=outfile,
                                     stderr=subprocess.PIPE)
-            _, err = process.communicate()
+            try:
+                # 避免设备断连时 adb exec-out 永久阻塞 Proxy 请求。
+                _, err = process.communicate(timeout=COMMAND_TIMEOUT_S)
+            except subprocess.TimeoutExpired as ex:
+                process.kill()
+                process.communicate()
+                raise AdbError(
+                    'Timeout executing adb command: adb {}\n{}'.format(params, repr(ex)))
             outfile.seek(0)
             if process.returncode != 0:
                 raise AdbError('Error executing adb command: adb {}\n'.format(params) + err.decode(
