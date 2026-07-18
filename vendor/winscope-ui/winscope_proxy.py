@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -491,6 +492,15 @@ class ADBWinscopeProxy(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+class IPv6HTTPServer(HTTPServer):
+    address_family = socket.AF_INET6
+
+
+def create_http_server(port: int) -> HTTPServer:
+    # Winscope UI 固定访问 localhost，当前主机优先将其解析为 IPv6 回环地址。
+    return IPv6HTTPServer(('::1', port), ADBWinscopeProxy)
+
+
 if __name__ == '__main__':
     args = create_argument_parser().parse_args()
 
@@ -503,7 +513,7 @@ if __name__ == '__main__':
     print("Winscope ADB Connect proxy version: " + VERSION)
     print('Winscope token: ' + secret_token)
 
-    httpd = HTTPServer(('localhost', args.port), ADBWinscopeProxy)
+    httpd = create_http_server(args.port)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

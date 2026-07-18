@@ -74,7 +74,7 @@ WINSCOPE_TOKEN_LOCATION=winscope-aosp/runtime/.token \
 python3 vendor/winscope-proxy/winscope_proxy.py -p 5544
 ```
 
-Proxy 同样只监听本机回环地址。Web UI 通过 Token 访问 Proxy，Proxy 再调用本机 `adb` 与设备交互。
+Proxy 同样只监听本机 IPv6 回环地址 `::1`。这是因为 AOSP 16 Winscope Web UI 固定访问 `http://localhost:5544`，而当前主机的 `localhost` 优先解析为 `::1`。Web UI 通过 Token 访问 Proxy，Proxy 再调用本机 `adb` 与设备交互。
 
 ### Trace 启停处理
 
@@ -120,7 +120,7 @@ cd /path/to/winscope_trace
 
 ```text
 UI:         http://127.0.0.1:8080
-Proxy:      http://127.0.0.1:5544
+Proxy:      http://localhost:5544
 Token:      <随机 Token>
 Runtime:    /path/to/winscope_trace/winscope-aosp/runtime
 ```
