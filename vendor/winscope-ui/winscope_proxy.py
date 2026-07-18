@@ -64,7 +64,7 @@ WINSCOPE_TOKEN_LOCATION = os.environ.get(
 )
 
 # Max interval between the client keep-alive requests in seconds
-KEEP_ALIVE_INTERVAL_S = 5
+KEEP_ALIVE_INTERVAL_S = 30
 
 # Perfetto's default timeout for getting an ACK from producer processes is 5s
 # We need to be sure that the timeout is longer than that with a good margin.
@@ -184,6 +184,10 @@ def call_adb(params: str, device: str = None, timeout: int = None):
         raise AdbError('Timeout executing adb command: {}\n{}'.format(command_str, repr(ex)))
     except subprocess.CalledProcessError as ex:
         return 'Error executing adb command: {}: {}'.format(command_str, ex.output.decode("utf-8"))
+
+
+def detach_background_command(command: str) -> str:
+    return re.sub(r'\s&\s', ' >/dev/null 2>&1 & ', command, count=1)
 
 
 # ENDPOINTS #
@@ -334,7 +338,7 @@ class TraceThread(threading.Thread):
         retry_interval = 0.1
         try:
             start_out = call_adb(
-                f"shell {self.trace_command}",
+                f"shell {detach_background_command(self.trace_command)}",
                 device=self._device_id,
                 timeout=COMMAND_TIMEOUT_S)
             self.out += start_out.encode('utf-8')
