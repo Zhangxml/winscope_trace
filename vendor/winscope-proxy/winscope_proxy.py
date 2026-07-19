@@ -83,6 +83,7 @@ ACTIVE_FETCH_PROCESSES = set()
 ACTIVE_FETCH_PROCESSES_LOCK = threading.Lock()
 
 EXPORT_TIMEOUT_S = 15 * 60
+EXPORT_TERMINATE_TIMEOUT_S = 5
 EXPORT_TTL_S = 10 * 60
 MAX_CONCURRENT_EXPORTS = 1
 EXPORT_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_EXPORTS)
@@ -604,8 +605,35 @@ def clear_pending_exports() -> None:
         pass
 
 
+def terminate_export_process(process, force=False) -> None:
+    if not force and process.poll() is not None:
+        return
+    process_group = process.pid
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=EXPORT_TERMINATE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=EXPORT_TERMINATE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        try:
+            process.communicate()
+        except (OSError, ValueError):
+            pass
+
+
 def call_export(command: list[str], work_dir: str) -> None:
     process = None
+    terminate_required = False
     try:
         with ACTIVE_EXPORT_PROCESSES_LOCK:
             if SHUTTING_DOWN.is_set():
@@ -615,13 +643,13 @@ def call_export(command: list[str], work_dir: str) -> None:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 shell=False,
+                start_new_session=True,
             )
             ACTIVE_EXPORT_PROCESSES[process] = work_dir
         try:
             process.communicate(timeout=EXPORT_TIMEOUT_S)
         except subprocess.TimeoutExpired as ex:
-            process.kill()
-            process.communicate()
+            terminate_required = True
             raise ExportError("Export command timed out") from ex
         if process.returncode != 0:
             raise ExportError("Export command failed")
@@ -629,9 +657,7 @@ def call_export(command: list[str], work_dir: str) -> None:
         raise ExportError("Export command failed") from ex
     finally:
         if process:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
+            terminate_export_process(process, force=terminate_required)
             with ACTIVE_EXPORT_PROCESSES_LOCK:
                 ACTIVE_EXPORT_PROCESSES.pop(process, None)
 
@@ -904,20 +930,9 @@ def stop_active_fetches():
 def stop_active_exports():
     with ACTIVE_EXPORT_PROCESSES_LOCK:
         active_processes = list(ACTIVE_EXPORT_PROCESSES.items())
-    for process, _ in active_processes:
-        try:
-            if process.poll() is None:
-                process.terminate()
-        except OSError as ex:
-            log.warning("Unable to terminate export process: {}".format(ex))
     for process, work_dir in active_processes:
         try:
-            if process.poll() is None:
-                try:
-                    process.wait(timeout=COMMAND_TIMEOUT_S)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            terminate_export_process(process, force=True)
         except OSError as ex:
             log.warning("Unable to stop export process: {}".format(ex))
         finally:
