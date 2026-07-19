@@ -52,7 +52,7 @@ winscope_trace/
     └── webui.log
 ```
 
-`runtime/` 是运行时目录，存放本地 Web UI 和 Proxy 的日志及 Token。Token 文件权限由 Proxy 设置为仅当前用户可读写。
+`runtime/` 是运行时目录，存放本地 Web UI 和 Proxy 的日志及 Token。启动脚本会将目录设为 `0700`，Token 和日志文件使用仅当前用户可读写的权限；Token 不会写入 `proxy.log`。
 
 ## 实现方式
 
@@ -75,12 +75,12 @@ WINSCOPE_TOKEN_LOCATION=runtime/.token \
 python3 vendor/winscope-proxy/winscope_proxy.py -p 5544
 ```
 
-Proxy 只监听本机 IPv6 回环地址 `::1`。Winscope Web UI 通过 `http://localhost:<Proxy端口>` 访问 Proxy，Proxy 再调用本机 `adb` 与设备交互；服务不会对局域网暴露。
+Proxy 只监听本机 IPv4 回环地址 `127.0.0.1`。Winscope Web UI 通过该地址访问 Proxy，Proxy 再调用本机 `adb` 与设备交互；服务不会对局域网暴露。
 
-当前启动脚本的 `Proxy:` 输出仍显示 `127.0.0.1`，但该地址不一定能直连 IPv6-only Proxy。手动填写 Proxy 地址时，应使用：
+手动填写 Proxy 地址时使用：
 
 ```text
-http://localhost:5544
+http://127.0.0.1:5544
 ```
 
 ### Trace 启停处理
@@ -94,9 +94,10 @@ TimeoutExpired(['adb', '-s', '<serial>', 'shell'], 15)
 本工具包的 Proxy 已调整为：
 
 1. 开始抓取时直接执行 Web UI 下发的 `startCmd`。
-2. 结束抓取时新建一次 `adb shell` 直接执行对应的 `stopCmd`。
-3. 对 trace 启停和文件拉取的 adb 子进程应用 15 秒超时；超时后终止 adb 子进程并返回明确错误，避免 Proxy 永久阻塞或以 HTTP 500 中断。
+2. 结束抓取、保活超时或 Proxy 收到终止信号时，直接执行对应的 `stopCmd`，且每条 trace 只会停止一次。脚本等待最多 35 秒完成优雅停止，超时后终止本地 Proxy。
+3. Trace 启停和普通 ADB 命令均应用 15 秒超时；浏览器 Proxy 的大文件 fetch 使用 10 分钟总时限与 30 秒无数据时限。非零退出会返回明确错误，避免把失败文本当作成功结果。
 4. 每个运行中的 trace 需要 Web UI 持续调用 `/status` 保活；连续 30 秒没有收到保活请求时，Proxy 自动执行该 trace 的 `stopCmd`。
+5. 单次文件拉取上限为 200 MiB，同一时刻只处理一个拉取请求；超过限制会被拒绝。文件先写入临时文件，再流式 gzip/Base64 编码为响应，避免为大文件同时保留多个完整内存副本。
 
 这样可确保 WindowManager trace、`screenrecord` 和 detached Perfetto session 在结束时执行真实的设备侧清理命令。
 
@@ -140,7 +141,7 @@ Runtime:    /path/to/winscope_trace/runtime
 浏览器打开脚本输出的 UI 地址。首次进入 Winscope 后：
 
 1. 在连接类型中选择 `Winscope Proxy`。
-2. 填入 `Proxy`：`http://localhost:5544`。
+2. 填入 `Proxy`：`http://127.0.0.1:5544`。
 3. 填入终端输出的 `Token`。
 4. 选择显示的 adb 设备。
 5. 选择需要的 trace 类型并开始抓取。
@@ -164,7 +165,7 @@ Runtime:    /path/to/winscope_trace/runtime
 
 ```text
 UI:     http://127.0.0.1:18080
-Proxy:  http://localhost:15544
+Proxy:  http://127.0.0.1:15544
 ```
 
 ### 从其他目录启动
@@ -174,6 +175,37 @@ Proxy:  http://localhost:15544
 ```
 
 通常不需要指定 `--root`；默认使用脚本所在目录。
+
+## 大文件导出
+
+浏览器中的 Winscope Proxy 兼容接口适合普通 trace。视频或大型 trace 建议使用 `winscope_fetch.py`，它直接通过 ADB 导出文件，避免浏览器 Base64 解码占用大量内存。
+
+该工具支持最大 200 MiB 文件、30 秒无数据超时、中断后续传、远端与本地 SHA-256 校验，以及校验成功后的原子完成。
+
+```bash
+python3 winscope_fetch.py \
+  --serial <设备序列号> \
+  /data/misc/wmtrace/screen.mp4
+```
+
+默认目标文件位于：
+
+```text
+runtime/downloads/<远端文件名>
+```
+
+可指定本机目标路径：
+
+```bash
+python3 winscope_fetch.py \
+  --serial <设备序列号> \
+  --output /path/to/screen.mp4 \
+  /data/misc/wmtrace/screen.mp4
+```
+
+传输中断后再次执行相同命令，工具会检查 `<目标文件>.part.json` 中保存的远端路径、文件大小和 SHA-256；元数据一致时从 `.part` 已有字节偏移继续。远端文件变化、大小不一致或 SHA-256 不一致时，不会生成目标文件，方便保留现场分片排查。
+
+主机临时目录需要至少保留目标文件大小的可用空间。下载完成后，在 Winscope UI 中通过 **Open trace file** 导入生成的文件。
 
 ## 常见问题
 
@@ -205,7 +237,7 @@ Ctrl+Shift+R
 
 ### 文件拉取超时
 
-Proxy 对单次 trace 启停和文件拉取均使用 15 秒超时。设备在抓取结束后断连、USB/adb 半断连，或 `adb exec-out` 无响应时，当前 trace 会报告超时而不会无限卡住。
+Proxy 对 trace 启停使用 15 秒超时。浏览器 Proxy 的大文件 fetch 使用 10 分钟总时限与 30 秒无数据时限；推荐使用 `winscope_fetch.py` 导出视频和大型 trace，它只在连续 30 秒无数据时中断，并保留 `.part` 分片用于恢复。
 
 重新连接设备后需要重新发起抓取；已经因设备退出而未拉取完成的 trace 文件无法从 Proxy 恢复。
 
