@@ -88,7 +88,7 @@ EXPORT_TTL_S = 10 * 60
 MAX_CONCURRENT_EXPORTS = 1
 EXPORT_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_EXPORTS)
 PENDING_EXPORTS: dict[str, tuple[str, float]] = {}
-PENDING_EXPORTS_LOCK = threading.Lock()
+PENDING_EXPORTS_LOCK = threading.RLock()
 PENDING_EXPORT_TIMERS: dict[str, threading.Timer] = {}
 ACTIVE_DOWNLOAD_ARCHIVES: set[str] = set()
 ACTIVE_EXPORT_PROCESSES: dict[subprocess.Popen, tuple[str, int]] = {}
@@ -557,13 +557,14 @@ def register_pending_export(download_id: str, archive_path: os.PathLike[str] | s
 
 def create_pending_export(archive_path: str) -> str:
     expires_at = time.monotonic() + EXPORT_TTL_S
-    while True:
-        download_id = secrets.token_urlsafe(32)
-        with PENDING_EXPORTS_LOCK:
+    with PENDING_EXPORTS_LOCK:
+        if SHUTTING_DOWN.is_set():
+            raise ExportError("Proxy is shutting down")
+        while True:
+            download_id = secrets.token_urlsafe(32)
             if download_id not in PENDING_EXPORTS:
-                break
-    register_pending_export(download_id, archive_path, expires_at)
-    return download_id
+                register_pending_export(download_id, archive_path, expires_at)
+                return download_id
 
 
 def take_pending_export(download_id: str) -> str | None:
@@ -888,7 +889,8 @@ SHUTTING_DOWN = threading.Event()
 
 def stop_active_traces():
     with TRACE_THREADS_LOCK:
-        SHUTTING_DOWN.set()
+        with PENDING_EXPORTS_LOCK:
+            SHUTTING_DOWN.set()
         active_threads = [
             thread
             for device_threads in TRACE_THREADS.values()
