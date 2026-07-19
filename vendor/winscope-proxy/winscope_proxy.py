@@ -26,11 +26,14 @@
 import argparse
 import base64
 import gzip
+import io
 import json
 import logging
 import os
 import re
 import secrets
+import select
+import signal
 import socket
 import subprocess
 import sys
@@ -39,7 +42,7 @@ import time
 from abc import abstractmethod
 from enum import Enum
 from http import HTTPStatus
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging import DEBUG, INFO
 from tempfile import NamedTemporaryFile
 
@@ -48,8 +51,8 @@ assert version.major == 3 and version.minor >= 10, "This script requires Python 
 
 # GLOBALS #
 
-log = None
-secret_token = None
+log: logging.Logger = logging.getLogger("winscope_proxy")
+secret_token = ""
 
 # Keep in sync with winscope_proxy_utils VERSION in Winscope
 VERSION = '6.0.0'
@@ -69,6 +72,41 @@ KEEP_ALIVE_INTERVAL_S = 30
 # Perfetto's default timeout for getting an ACK from producer processes is 5s
 # We need to be sure that the timeout is longer than that with a good margin.
 COMMAND_TIMEOUT_S = 15
+MAX_FETCH_SIZE_BYTES = 200 * 1024 * 1024
+MAX_CONCURRENT_FETCHES = 1
+FETCH_TIMEOUT_S = 10 * 60
+FETCH_IDLE_TIMEOUT_S = 30
+FETCH_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_FETCHES)
+ACTIVE_FETCH_PROCESSES = set()
+ACTIVE_FETCH_PROCESSES_LOCK = threading.Lock()
+
+
+class Base64JsonWriter(io.RawIOBase):
+    """将二进制流编码为可直接嵌入 JSON 字符串的 Base64 数据。"""
+
+    def __init__(self, stream):
+        super().__init__()
+        self._stream = stream
+        self._pending = b''
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        payload = self._pending + data
+        encoded_length = len(payload) - (len(payload) % 3)
+        if encoded_length:
+            self._stream.write(base64.b64encode(payload[:encoded_length]))
+        self._pending = payload[encoded_length:]
+        return len(data)
+
+    def finish(self):
+        if self._pending:
+            self._stream.write(base64.b64encode(self._pending))
+            self._pending = b''
+
+    def flush(self):
+        self._stream.flush()
 
 
 # CONFIG #
@@ -85,24 +123,34 @@ def create_argument_parser() -> argparse.ArgumentParser:
 
 def get_token() -> str:
     """Returns saved proxy security token or creates new one"""
+    token_dir = os.path.dirname(WINSCOPE_TOKEN_LOCATION)
+    if token_dir:
+        os.makedirs(token_dir, mode=0o700, exist_ok=True)
     try:
         with open(WINSCOPE_TOKEN_LOCATION, 'r') as token_file:
-            token = token_file.readline()
-            log.debug("Loaded token {} from {}".format(
-                token, WINSCOPE_TOKEN_LOCATION))
+            token = token_file.readline().strip()
+            if not token:
+                raise IOError('Token file is empty')
+            os.chmod(WINSCOPE_TOKEN_LOCATION, 0o600)
+            log.debug("Loaded proxy token from {}".format(
+                WINSCOPE_TOKEN_LOCATION))
             return token
     except IOError:
         token = secrets.token_hex(32)
-        os.makedirs(os.path.dirname(WINSCOPE_TOKEN_LOCATION), exist_ok=True)
         try:
-            with open(WINSCOPE_TOKEN_LOCATION, 'w') as token_file:
-                log.debug("Created and saved token {} to {}".format(
-                    token, WINSCOPE_TOKEN_LOCATION))
+            fd = os.open(
+                WINSCOPE_TOKEN_LOCATION,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            with os.fdopen(fd, 'w') as token_file:
                 token_file.write(token)
             os.chmod(WINSCOPE_TOKEN_LOCATION, 0o600)
+            log.debug("Created proxy token at {}".format(
+                WINSCOPE_TOKEN_LOCATION))
         except IOError:
-            log.error("Unable to save persistent token {} to {}".format(
-                token, WINSCOPE_TOKEN_LOCATION))
+            log.error("Unable to save persistent token to {}".format(
+                WINSCOPE_TOKEN_LOCATION))
         return token
 
 
@@ -172,18 +220,27 @@ class RequestRouter:
                 return self._internal_error(repr(ex))
         self._bad_request("No endpoint specified")
 
-def call_adb(params: str, device: str = None, timeout: int = None):
+def call_adb(
+    params: str,
+    device: str | None = None,
+    timeout: int | None = None,
+):
     command = ['adb'] + (['-s', device] if device else []) + params.split(' ')
     command_str = ' '.join(command)
     try:
         log.debug("Call: " + command_str)
-        return subprocess.check_output(command, stderr=subprocess.STDOUT, timeout=timeout).decode('utf-8')
+        return subprocess.check_output(
+            command,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        ).decode('utf-8', errors='replace')
     except OSError as ex:
         raise AdbError('OS Error executing adb command: {}\n{}'.format(command_str, repr(ex)))
     except subprocess.TimeoutExpired as ex:
         raise AdbError('Timeout executing adb command: {}\n{}'.format(command_str, repr(ex)))
     except subprocess.CalledProcessError as ex:
-        return 'Error executing adb command: {}: {}'.format(command_str, ex.output.decode("utf-8"))
+        output = ex.output.decode('utf-8', errors='replace') if ex.output else ''
+        raise AdbError('Error executing adb command: {}: {}'.format(command_str, output))
 
 
 def detach_background_command(command: str) -> str:
@@ -196,7 +253,8 @@ class ListDevicesEndpoint(RequestEndpoint):
     ADB_INFO_RE = re.compile("^([A-Za-z0-9._:\\-]+)\\s+(\\w+)(.*model:(\\w+))?")
 
     def process(self, server, path):
-        lines = list(filter(None, call_adb('devices -l').split('\n')))
+        lines = list(filter(None, call_adb(
+            'devices -l', timeout=COMMAND_TIMEOUT_S).split('\n')))
         devices = []
         for m in [ListDevicesEndpoint.ADB_INFO_RE.match(d) for d in lines[1:]]:
             if m:
@@ -235,50 +293,134 @@ class FetchEndpoint(DeviceRequestEndpoint):
     def process_with_device(self, server, path: list[str], device_id):
         filepath = '/'.join(path)
         log.debug(filepath)
-        file_buffer = self.fetch_existing_file(filepath, device_id)
-        server.respond(HTTPStatus.OK, json.dumps(file_buffer).encode("utf-8"), "text/json")
-
-    def fetch_existing_file(self, filepath, device_id):
-        file_buffer = dict()
+        if not FETCH_SEMAPHORE.acquire(blocking=False):
+            raise BadRequest("Too many concurrent fetch requests")
+        response_started = False
         try:
             with NamedTemporaryFile() as tmp:
-                log.debug(
-                    f"Fetching file {filepath} from device to {tmp.name}")
-                try:
-                    self.call_adb_outfile('exec-out su root cat ' +
-                                        filepath, tmp, device_id)
-                except AdbError as ex:
-                    log.warning(f"Unable to fetch file {filepath} - {repr(ex)}")
-                    return
-                log.debug(f"Uploading file {tmp.name}")
-                buf = base64.encodebytes(gzip.compress(tmp.read())).decode("utf-8")
-                file_buffer[filepath] = buf
-        except:
-            self.log_no_files_warning()
-        return file_buffer
+                self._fetch_to_tempfile(filepath, tmp, device_id)
+                if hasattr(server, 'connection'):
+                    server.connection.settimeout(FETCH_IDLE_TIMEOUT_S)
+                server.send_response(HTTPStatus.OK)
+                server.send_header('Content-type', 'text/json')
+                if hasattr(server, 'add_standard_headers'):
+                    server.add_standard_headers()
+                else:
+                    server.end_headers()
+                response_started = True
+                server.wfile.write(b'{' + json.dumps(filepath).encode('utf-8') + b':"')
+                encoded_output = Base64JsonWriter(server.wfile)
+                with gzip.GzipFile(fileobj=encoded_output, mode='wb') as compressed:
+                    while chunk := tmp.read(64 * 1024):
+                        compressed.write(chunk)
+                encoded_output.finish()
+                server.wfile.write(b'"}')
+        except (BrokenPipeError, ConnectionResetError, socket.timeout) as ex:
+            if response_started:
+                log.warning("Client disconnected while fetching {}: {}".format(filepath, ex))
+                return
+            raise AdbError("Unable to fetch {}: {}".format(filepath, ex))
+        finally:
+            FETCH_SEMAPHORE.release()
 
-    def log_no_files_warning(self):
-        log.warning("Proxy didn't find any file to fetch")
+    def _fetch_to_tempfile(self, filepath, tmp, device_id):
+        log.debug(f"Fetching file {filepath} from device to {tmp.name}")
+        self.call_adb_outfile(
+            'exec-out su root cat ' + filepath,
+            tmp,
+            device_id,
+            max_bytes=MAX_FETCH_SIZE_BYTES,
+            timeout_s=FETCH_TIMEOUT_S,
+        )
+        tmp.seek(0, os.SEEK_END)
+        file_size = tmp.tell()
+        if file_size > MAX_FETCH_SIZE_BYTES:
+            raise AdbError(
+                'Refusing to fetch {} bytes from {}: limit is {} bytes'.format(
+                    file_size, filepath, MAX_FETCH_SIZE_BYTES))
+        tmp.seek(0)
 
-    def call_adb_outfile(self, params: str, outfile, device: str):
+    def call_adb_outfile(
+        self,
+        params: str,
+        outfile,
+        device: str,
+        max_bytes: int,
+        timeout_s: int,
+    ):
+        process = None
         try:
-            process = subprocess.Popen(['adb'] + ['-s', device] + params.split(' '), stdout=outfile,
-                                    stderr=subprocess.PIPE)
+            with ACTIVE_FETCH_PROCESSES_LOCK:
+                if SHUTTING_DOWN.is_set():
+                    raise AdbError("Proxy is shutting down")
+                process = subprocess.Popen(
+                    ['adb', '-s', device] + params.split(' '),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                ACTIVE_FETCH_PROCESSES.add(process)
+            if not process.stdout or not process.stderr:
+                raise AdbError('Unable to capture adb output: adb {}'.format(params))
+
+            deadline = time.monotonic() + timeout_s
+            total_bytes = 0
+            stderr = bytearray()
+            streams = [process.stdout, process.stderr]
+            while streams:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.kill()
+                    process.wait()
+                    raise AdbError('Timeout executing adb command: adb {}'.format(params))
+                readable, _, _ = select.select(
+                    streams, [], [], min(remaining, FETCH_IDLE_TIMEOUT_S))
+                if not readable:
+                    process.kill()
+                    process.wait()
+                    raise AdbError('Fetch stalled while executing adb command: adb {}'.format(params))
+                for stream in readable:
+                    chunk = os.read(stream.fileno(), 64 * 1024)
+                    if not chunk:
+                        streams.remove(stream)
+                        continue
+                    if stream is process.stdout:
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            process.kill()
+                            process.wait()
+                            raise AdbError(
+                                'Refusing to fetch more than {} bytes from {}'.format(
+                                    max_bytes, params))
+                        outfile.write(chunk)
+                    elif len(stderr) < 64 * 1024:
+                        stderr.extend(chunk[:64 * 1024 - len(stderr)])
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise AdbError('Timeout executing adb command: adb {}'.format(params))
             try:
-                # 避免设备断连时 adb exec-out 永久阻塞 Proxy 请求。
-                _, err = process.communicate(timeout=COMMAND_TIMEOUT_S)
+                process.wait(timeout=remaining)
             except subprocess.TimeoutExpired as ex:
                 process.kill()
-                process.communicate()
+                process.wait()
                 raise AdbError(
                     'Timeout executing adb command: adb {}\n{}'.format(params, repr(ex)))
             outfile.seek(0)
             if process.returncode != 0:
-                raise AdbError('Error executing adb command: adb {}\n'.format(params) + err.decode(
-                    'utf-8') + '\n' + outfile.read().decode('utf-8'))
+                raise AdbError('Error executing adb command: adb {}\n{}'.format(
+                    params, stderr.decode('utf-8', errors='replace')))
         except OSError as ex:
             raise AdbError(
                 'Error executing adb command: adb {}\n{}'.format(params, repr(ex)))
+        finally:
+            if process and process.poll() is None:
+                process.kill()
+                process.wait()
+            if process:
+                with ACTIVE_FETCH_PROCESSES_LOCK:
+                    ACTIVE_FETCH_PROCESSES.discard(process)
 
 class TraceThread(threading.Thread):
     def __init__(self, target_id: str, device_id: str, start_command: str, stop_command: str):
@@ -287,80 +429,130 @@ class TraceThread(threading.Thread):
         self.target_id = target_id
         self._device_id = device_id
         self._keep_alive_timer = None
+        self._timer_generation = 0
         self.out = b''
         self.err = b''
         self._command_timed_out = False
         self._success = False
         self._stop_event = threading.Event()
+        self._stop_complete = threading.Event()
+        self._start_complete = threading.Event()
+        self._state_lock = threading.Lock()
+        self._trace_started = False
+        self._stop_requested = False
 
-        super().__init__()
+        super().__init__(daemon=True)
 
-    def timeout(self):
-        if self.is_alive():
-            log.warning("Keep-alive timeout for {} trace on {}".format(self.target_id, self._device_id))
-            self.end_trace()
+    def timeout(self, generation):
+        self.end_trace(expected_timer_generation=generation)
 
     def reset_timer(self):
         log.info(
             "Resetting keep-alive clock for {} trace on {}".format(self.target_id, self._device_id))
-        if self._keep_alive_timer:
-            self._keep_alive_timer.cancel()
-        self._keep_alive_timer = threading.Timer(
-            KEEP_ALIVE_INTERVAL_S, self.timeout)
-        self._keep_alive_timer.start()
+        with self._state_lock:
+            if self._stop_requested:
+                return
+            if self._keep_alive_timer:
+                self._keep_alive_timer.cancel()
+            self._timer_generation += 1
+            self._keep_alive_timer = threading.Timer(
+                KEEP_ALIVE_INTERVAL_S, self.timeout, args=(self._timer_generation,))
+            self._keep_alive_timer.start()
 
-    def end_trace(self):
-        if self._keep_alive_timer:
-            self._keep_alive_timer.cancel()
-        log.info("Stopping {} trace on {}".format(
-            self.target_id,
-            self._device_id))
+    def end_trace(self, expected_timer_generation=None):
+        wait_for_start = False
+        keep_alive_timer = None
+        should_stop = False
+        with self._state_lock:
+            if (
+                expected_timer_generation is not None
+                and expected_timer_generation != self._timer_generation
+            ):
+                return True
+            if self._stop_requested:
+                wait_for_stop = True
+            else:
+                wait_for_stop = False
+                self._stop_requested = True
+                keep_alive_timer = self._keep_alive_timer
+                wait_for_start = not self._start_complete.is_set()
+                self._timer_generation += 1
 
-        if self._stop_command.strip():
-            try:
-                stop_out = call_adb(f"shell {self._stop_command}",
-                    device=self._device_id,
-                    timeout=COMMAND_TIMEOUT_S)
-                self.out += stop_out.encode('utf-8')
-            except AdbError as ex:
-                self.err += str(ex).encode('utf-8')
-                if 'TimeoutExpired' in str(ex):
-                    self._command_timed_out = True
-        self._stop_event.set()
+        if wait_for_stop:
+            return self._stop_complete.wait(timeout=(2 * COMMAND_TIMEOUT_S) + 1)
+
+        if wait_for_start:
+            self._start_complete.wait()
+        with self._state_lock:
+                should_stop = self._trace_started and bool(self._stop_command.strip())
 
         try:
-            log.debug("Waiting for {} trace worker to exit for {}".format(
-                self.target_id,
-                self._device_id))
-            self.join(timeout=COMMAND_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            self._command_timed_out = True
-        if self.is_alive():
-            self._command_timed_out = True
-            log.error("TIMEOUT - {} trace worker did not exit for {}".format(
+            if keep_alive_timer:
+                keep_alive_timer.cancel()
+            log.warning("Stopping {} trace on {}".format(
+                self.target_id, self._device_id))
+            log.info("Stopping {} trace on {}".format(
                 self.target_id,
                 self._device_id))
 
+            if should_stop:
+                try:
+                    stop_out = call_adb(f"shell {self._stop_command}",
+                        device=self._device_id,
+                        timeout=COMMAND_TIMEOUT_S)
+                    self.out += stop_out.encode('utf-8')
+                except AdbError as ex:
+                    self.err += str(ex).encode('utf-8')
+                    if 'Timeout executing' in str(ex):
+                        self._command_timed_out = True
+            self._stop_event.set()
+
+            if threading.current_thread() is not self and self.is_alive():
+                log.debug("Waiting for {} trace worker to exit for {}".format(
+                    self.target_id,
+                    self._device_id))
+                self.join(timeout=COMMAND_TIMEOUT_S)
+            if self.is_alive():
+                self._command_timed_out = True
+                log.error("TIMEOUT - {} trace worker did not exit for {}".format(
+                    self.target_id,
+                    self._device_id))
+        finally:
+            self._stop_complete.set()
+        return True
+
     def run(self):
-        retry_interval = 0.1
+        with self._state_lock:
+            if self._stop_requested:
+                self._start_complete.set()
+                return
         try:
             start_out = call_adb(
                 f"shell {detach_background_command(self.trace_command)}",
                 device=self._device_id,
                 timeout=COMMAND_TIMEOUT_S)
-            self.out += start_out.encode('utf-8')
+            with self._state_lock:
+                self.out += start_out.encode('utf-8')
+                self._trace_started = True
+                self._start_complete.set()
         except AdbError as ex:
-            self.err += str(ex).encode('utf-8')
-            if 'TimeoutExpired' in str(ex):
-                self._command_timed_out = True
+            with self._state_lock:
+                self.err += str(ex).encode('utf-8')
+                self._start_complete.set()
+                if 'Timeout executing' in str(ex):
+                    self._command_timed_out = True
             return
 
         log.info("Trace {} started on {}".format(self.target_id, self._device_id))
+        if not self._stop_command.strip():
+            with self._state_lock:
+                self._success = self._trace_started and len(self.err) == 0
+            return
         self.reset_timer()
-        if self._stop_command.strip():
-            self._stop_event.wait()
+        self._stop_event.wait()
         log.info("Trace {} ended on {}".format(self.target_id, self._device_id))
-        self._success = len(self.err) == 0
+        with self._state_lock:
+            self._success = self._trace_started and len(self.err) == 0
 
     def success(self):
         return self._success
@@ -369,6 +561,46 @@ class TraceThread(threading.Thread):
         return self._command_timed_out
 
 TRACE_THREADS: dict[str, dict[str, TraceThread]] = {}
+TRACE_THREADS_LOCK = threading.Lock()
+SHUTTING_DOWN = threading.Event()
+
+
+def stop_active_traces():
+    with TRACE_THREADS_LOCK:
+        SHUTTING_DOWN.set()
+        active_threads = [
+            thread
+            for device_threads in TRACE_THREADS.values()
+            for thread in device_threads.values()
+        ]
+
+    stop_active_fetches()
+
+    stop_workers = [
+        threading.Thread(target=thread.end_trace, daemon=True)
+        for thread in active_threads
+    ]
+    for worker in stop_workers:
+        worker.start()
+    deadline = time.monotonic() + (2 * COMMAND_TIMEOUT_S) + 1
+    for worker in stop_workers:
+        worker.join(timeout=max(0, deadline - time.monotonic()))
+
+    with TRACE_THREADS_LOCK:
+        TRACE_THREADS.clear()
+
+
+def stop_active_fetches():
+    with ACTIVE_FETCH_PROCESSES_LOCK:
+        active_processes = list(ACTIVE_FETCH_PROCESSES)
+
+    for process in active_processes:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    with ACTIVE_FETCH_PROCESSES_LOCK:
+        for process in active_processes:
+            ACTIVE_FETCH_PROCESSES.discard(process)
 
 class StartTraceEndpoint(DeviceRequestEndpoint):
     def process_with_device(self, server, path, device_id):
@@ -377,35 +609,40 @@ class StartTraceEndpoint(DeviceRequestEndpoint):
         start_cmd = request.get("startCmd")
         stop_cmd = request.get("stopCmd")
 
-        log.debug(f"Executing start command for {target_id} on {device_id}...")
-        thread = TraceThread(target_id, device_id, start_cmd, stop_cmd)
-        if device_id not in TRACE_THREADS:
-            threads = {}
-            threads[target_id] = thread
-            TRACE_THREADS[device_id] = threads
+        if not isinstance(target_id, str) or not target_id.strip():
+            raise BadRequest("targetId, startCmd and stopCmd must be non-empty strings")
+        if not isinstance(start_cmd, str) or not start_cmd.strip():
+            raise BadRequest("targetId, startCmd and stopCmd must be non-empty strings")
+        if not isinstance(stop_cmd, str):
+            raise BadRequest("targetId, startCmd and stopCmd must be non-empty strings")
 
-        else:
-            TRACE_THREADS[device_id][target_id] = thread
-        thread.start()
+        log.debug(f"Executing start command for {target_id} on {device_id}...")
+        with TRACE_THREADS_LOCK:
+            if SHUTTING_DOWN.is_set():
+                raise BadRequest("Proxy is shutting down")
+            threads = TRACE_THREADS.setdefault(device_id, {})
+            active_thread = threads.get(target_id)
+            if active_thread and active_thread.is_alive():
+                raise BadRequest("{} trace already in progress for {}".format(target_id, device_id))
+            thread = TraceThread(target_id, device_id, start_cmd, stop_cmd)
+            threads[target_id] = thread
+            thread.start()
 
         server.respond(HTTPStatus.OK, ''.encode('utf-8'), "text/json")
 
 class EndTraceEndpoint(DeviceRequestEndpoint):
     def process_with_device(self, server, path, device_id):
-        if device_id not in TRACE_THREADS:
-            raise BadRequest("No trace in progress for {}".format(device_id))
-
         request = self.get_request(server)
         target_id = request.get("targetId")
-        threads = TRACE_THREADS[device_id]
-        if target_id not in threads:
-            raise BadRequest("No {} trace in progress for {}".format(target_id, device_id))
+        with TRACE_THREADS_LOCK:
+            threads = TRACE_THREADS.get(device_id)
+            if not threads or target_id not in threads:
+                raise BadRequest("No {} trace in progress for {}".format(target_id, device_id))
+            thread = threads[target_id]
 
         errors: list[str] = []
-        thread = threads[target_id]
-
-        if thread.is_alive():
-            thread.end_trace()
+        if not thread.end_trace():
+            raise BadRequest("{} trace is still stopping".format(target_id))
         success = thread.success()
 
         if (thread.timed_out()):
@@ -423,32 +660,54 @@ class EndTraceEndpoint(DeviceRequestEndpoint):
             (thread.err if thread.err else b'<no stderr>') + b"\n"
         log.debug("### Output ###\n".format(target_id) + out.decode("utf-8"))
 
-        threads.pop(target_id)
-
-        if len(threads) == 0:
-            TRACE_THREADS.pop(device_id)
+        with TRACE_THREADS_LOCK:
+            threads = TRACE_THREADS.get(device_id)
+            if threads and threads.get(target_id) is thread:
+                threads.pop(target_id)
+                if len(threads) == 0:
+                    TRACE_THREADS.pop(device_id)
         server.respond(HTTPStatus.OK, json.dumps(errors).encode("utf-8"), "text/plain")
 
 class StatusEndpoint(DeviceRequestEndpoint):
     def process_with_device(self, server, path, device_id):
-        if device_id not in TRACE_THREADS:
-            raise BadRequest("No trace in progress for {}".format(device_id))
-
-        if path[0] not in TRACE_THREADS[device_id]:
-            log.debug(path[0])
-            log.debug(TRACE_THREADS[device_id])
+        if not path:
+            raise BadRequest("Trace id not specified")
+        target_id = path[0]
+        with TRACE_THREADS_LOCK:
+            threads = TRACE_THREADS.get(device_id)
+            thread = threads.get(target_id) if threads else None
+        if not thread:
+            log.debug(target_id)
             server.respond(HTTPStatus.OK, str(False).encode("utf-8"), "text/plain")
         else:
-            thread = TRACE_THREADS[device_id][path[0]]
             thread.reset_timer()
             server.respond(HTTPStatus.OK, str(thread.is_alive()).encode("utf-8"), "text/plain")
 
 class RunAdbCmdEndpoint(DeviceRequestEndpoint):
     def process_with_device(self, server, path, device_id):
         request: dict = self.get_request(server)
-        cmd: str = request.get("cmd")
-        output = call_adb(cmd, device_id)
+        cmd = request.get("cmd")
+        if not isinstance(cmd, str) or not cmd.strip():
+            raise BadRequest("cmd must be a non-empty string")
+        try:
+            output = call_adb(cmd, device_id, timeout=COMMAND_TIMEOUT_S)
+        except AdbError as error:
+            if self.is_optional_missing_find(cmd, error):
+                output = ""
+            else:
+                raise
         server.respond(HTTPStatus.OK, json.dumps(output).encode("utf-8"), "text/plain")
+
+    @staticmethod
+    def is_optional_missing_find(command: str, error: AdbError) -> bool:
+        normalized = command.strip()
+        is_find = (
+            normalized.startswith("find ")
+            or normalized.startswith("su root find ")
+            or normalized.startswith("shell find ")
+            or normalized.startswith("shell su root find ")
+        )
+        return is_find and "No such file or directory" in str(error)
 
 
 class ADBWinscopeProxy(BaseHTTPRequestHandler):
@@ -503,13 +762,12 @@ class ADBWinscopeProxy(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-class IPv6HTTPServer(HTTPServer):
-    address_family = socket.AF_INET6
+class LoopbackHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
 
 
-def create_http_server(port: int) -> HTTPServer:
-    # Winscope UI 固定访问 localhost，当前主机优先将其解析为 IPv6 回环地址。
-    return IPv6HTTPServer(('::1', port), ADBWinscopeProxy)
+def create_http_server(port: int) -> ThreadingHTTPServer:
+    return LoopbackHTTPServer(('127.0.0.1', port), ADBWinscopeProxy)
 
 
 if __name__ == '__main__':
@@ -522,10 +780,16 @@ if __name__ == '__main__':
     secret_token = get_token()
 
     print("Winscope ADB Connect proxy version: " + VERSION)
-    print('Winscope token: ' + secret_token)
 
     httpd = create_http_server(args.port)
+    def shutdown_proxy(_signum, _frame):
+        log.info("Shutting down Winscope Proxy")
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, shutdown_proxy)
+    signal.signal(signal.SIGTERM, shutdown_proxy)
     try:
         httpd.serve_forever()
-    except KeyboardInterrupt:
-        log.info("Shutting down")
+    finally:
+        stop_active_traces()
+        httpd.server_close()

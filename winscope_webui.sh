@@ -12,6 +12,8 @@ open_browser=true
 webui_pid=""
 proxy_pid=""
 
+umask 077
+
 usage() {
     cat <<'EOF'
 用法: winscope_webui.sh [选项]
@@ -40,11 +42,22 @@ error() {
 cleanup() {
     if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>/dev/null; then
         kill "$proxy_pid" 2>/dev/null || true
+        for ((attempt = 0; attempt < 350; attempt++)); do
+            if ! kill -0 "$proxy_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+        if kill -0 "$proxy_pid" 2>/dev/null; then
+            kill -KILL "$proxy_pid" 2>/dev/null || true
+        fi
         wait "$proxy_pid" 2>/dev/null || true
+        proxy_pid=""
     fi
     if [[ -n "$webui_pid" ]] && kill -0 "$webui_pid" 2>/dev/null; then
         kill "$webui_pid" 2>/dev/null || true
         wait "$webui_pid" 2>/dev/null || true
+        webui_pid=""
     fi
 }
 
@@ -122,6 +135,7 @@ is_port_free "$ui_port" || error "UI 端口已被占用: $ui_port，可使用 --
 is_port_free "$proxy_port" || error "Proxy 端口已被占用: $proxy_port，可使用 --proxy-port 指定其他端口"
 
 mkdir -p "$runtime_dir"
+chmod 700 "$runtime_dir"
 rm -f "$webui_log" "$proxy_log"
 
 trap cleanup EXIT INT TERM
@@ -129,7 +143,7 @@ trap cleanup EXIT INT TERM
 python3 -m http.server "$ui_port" --bind 127.0.0.1 --directory "$ui_dir" > "$webui_log" 2>&1 &
 webui_pid=$!
 
-for _ in $(seq 1 50); do
+for ((attempt = 0; attempt < 50; attempt++)); do
     if ! kill -0 "$webui_pid" 2>/dev/null; then
         error "Winscope Web UI 启动失败，请查看: $webui_log"
     fi
@@ -144,15 +158,8 @@ WINSCOPE_TOKEN_LOCATION="$token_file" python3 "$proxy_path" -p "$proxy_port" > "
 proxy_pid=$!
 
 token=""
-for _ in $(seq 1 50); do
-    if [[ -f "$proxy_log" ]]; then
-        while IFS= read -r line; do
-            case "$line" in
-                'Winscope token: '*) token="${line#Winscope token: }" ;;
-            esac
-        done < "$proxy_log"
-    fi
-    if [[ -z "$token" ]] && [[ -f "$token_file" ]]; then
+for ((attempt = 0; attempt < 50; attempt++)); do
+    if [[ -f "$token_file" ]]; then
         token="$(head -1 "$token_file")"
     fi
     [[ -n "$token" ]] && break
