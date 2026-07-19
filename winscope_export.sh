@@ -52,8 +52,8 @@ output_dir=$(dirname -- "$output")
 
 trace_name=$(basename -- "$remote_path")
 case "$trace_name" in
-    ''|.|..|/*)
-        fail '--remote-path 必须指向文件'
+    ''|.|..|/*|*'\'*|*[[:cntrl:]]*)
+        fail '最终文件名不安全'
         ;;
 esac
 
