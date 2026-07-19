@@ -14,25 +14,31 @@ fail() {
 serial=''
 remote_path=''
 output=''
+serial_seen=false
+remote_path_seen=false
+output_seen=false
 
 while (($#)); do
     case "$1" in
         --serial)
             (($# >= 2)) || fail '--serial 缺少参数'
-            [[ -z $serial ]] || fail '--serial 只能指定一次'
+            [[ $serial_seen == false ]] || fail '--serial 只能指定一次'
             serial=$2
+            serial_seen=true
             shift 2
             ;;
         --remote-path)
             (($# >= 2)) || fail '--remote-path 缺少参数'
-            [[ -z $remote_path ]] || fail '--remote-path 只能指定一次'
+            [[ $remote_path_seen == false ]] || fail '--remote-path 只能指定一次'
             remote_path=$2
+            remote_path_seen=true
             shift 2
             ;;
         --output)
             (($# >= 2)) || fail '--output 缺少参数'
-            [[ -z $output ]] || fail '--output 只能指定一次'
+            [[ $output_seen == false ]] || fail '--output 只能指定一次'
             output=$2
+            output_seen=true
             shift 2
             ;;
         *)
