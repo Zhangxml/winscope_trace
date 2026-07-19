@@ -33,6 +33,8 @@ import os
 import re
 import secrets
 import select
+import shutil
+import stat
 import signal
 import socket
 import subprocess
@@ -44,7 +46,7 @@ from enum import Enum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging import DEBUG, INFO
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, mkdtemp
 
 version = sys.version_info
 assert version.major == 3 and version.minor >= 10, "This script requires Python 3.10+ and ADB installed and in system PATH."
@@ -79,6 +81,14 @@ FETCH_IDLE_TIMEOUT_S = 30
 FETCH_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_FETCHES)
 ACTIVE_FETCH_PROCESSES = set()
 ACTIVE_FETCH_PROCESSES_LOCK = threading.Lock()
+
+EXPORT_TIMEOUT_S = 15 * 60
+EXPORT_TTL_S = 10 * 60
+MAX_CONCURRENT_EXPORTS = 1
+EXPORT_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_EXPORTS)
+PENDING_EXPORTS: dict[str, tuple[str, float]] = {}
+PENDING_EXPORTS_LOCK = threading.Lock()
+ACTIVE_DOWNLOAD_ARCHIVES: set[str] = set()
 
 
 class Base64JsonWriter(io.RawIOBase):
@@ -161,6 +171,8 @@ class RequestType(Enum):
 
 class RequestEndpoint:
     """Request endpoint to use with the RequestRouter."""
+    requires_token = True
+
 
     @abstractmethod
     def process(self, server, path):
@@ -173,6 +185,11 @@ class AdbError(Exception):
 class BadRequest(Exception):
     """Invalid client request"""
     pass
+
+class ExportError(Exception):
+    """无法创建或读取导出归档。"""
+    pass
+
 
 class RequestRouter:
     """Handles HTTP request authentication and routing"""
@@ -200,25 +217,31 @@ class RequestRouter:
                              'text/txt')
 
     def process(self, method: RequestType):
-        token = self.request.headers[WINSCOPE_TOKEN_HEADER]
-        if not token or token != secret_token:
-            return self._bad_token()
-        path = self.request.path.strip('/').split('/')
-        if path and len(path) > 0:
-            endpoint_name = path[0]
-            try:
-                return self.endpoints[(method, endpoint_name)].process(self.request, path[1:])
-            except KeyError as ex:
-                if "RequestType" in repr(ex):
-                    return self._bad_request("Unknown endpoint /{}/".format(endpoint_name))
-                return self._internal_error(repr(ex))
-            except AdbError as ex:
-                return self._internal_error(str(ex))
-            except BadRequest as ex:
-                return self._bad_request(str(ex))
-            except Exception as ex:
-                return self._internal_error(repr(ex))
-        self._bad_request("No endpoint specified")
+        path = [part for part in self.request.path.strip('/').split('/') if part]
+        if not path:
+            return self._bad_request("No endpoint specified")
+
+        endpoint_name = path[0]
+        endpoint = self.endpoints.get((method, endpoint_name))
+        if endpoint is None:
+            return self._bad_request("Unknown endpoint /{}/".format(endpoint_name))
+
+        if endpoint.requires_token:
+            token = self.request.headers.get(WINSCOPE_TOKEN_HEADER)
+            if not token or token != secret_token:
+                return self._bad_token()
+
+        try:
+            return endpoint.process(self.request, path[1:])
+        except AdbError as ex:
+            return self._internal_error(str(ex))
+        except BadRequest as ex:
+            return self._bad_request(str(ex))
+        except ExportError as ex:
+            log.error("Export error: " + str(ex))
+            return self._internal_error("Unable to export archive")
+        except Exception as ex:
+            return self._internal_error(repr(ex))
 
 def call_adb(
     params: str,
@@ -287,7 +310,10 @@ class DeviceRequestEndpoint(RequestEndpoint):
             raise BadRequest("Missing Content-Length header\n" + str(err))
         except ValueError as err:
             raise BadRequest("Content length unreadable\n" + str(err))
-        return json.loads(server.rfile.read(length).decode("utf-8"))
+        try:
+            return json.loads(server.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as err:
+            raise BadRequest("Request body must be valid JSON") from err
 
 class FetchEndpoint(DeviceRequestEndpoint):
     def process_with_device(self, server, path: list[str], device_id):
@@ -421,6 +447,208 @@ class FetchEndpoint(DeviceRequestEndpoint):
             if process:
                 with ACTIVE_FETCH_PROCESSES_LOCK:
                     ACTIVE_FETCH_PROCESSES.discard(process)
+
+def get_export_dir() -> str:
+    export_dir = os.environ.get("WINSCOPE_EXPORT_DIR")
+    if not export_dir or not os.path.isabs(export_dir):
+        raise BadRequest("WINSCOPE_EXPORT_DIR must be an absolute private directory")
+    try:
+        export_dir = os.path.realpath(export_dir)
+        directory_stat = os.stat(export_dir)
+    except (OSError, ValueError) as ex:
+        raise BadRequest("WINSCOPE_EXPORT_DIR is unavailable") from ex
+    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_IMODE(directory_stat.st_mode) & 0o077:
+        raise BadRequest("WINSCOPE_EXPORT_DIR must be a private directory")
+    return export_dir
+
+
+def _remove_export_archive(archive_path: str) -> None:
+    try:
+        os.remove(archive_path)
+    except FileNotFoundError:
+        pass
+    except OSError as ex:
+        log.warning("Unable to remove exported archive: {}".format(ex))
+    try:
+        shutil.rmtree(os.path.dirname(archive_path))
+    except FileNotFoundError:
+        pass
+    except OSError as ex:
+        log.warning("Unable to remove exported archive directory: {}".format(ex))
+    finally:
+        with PENDING_EXPORTS_LOCK:
+            ACTIVE_DOWNLOAD_ARCHIVES.discard(archive_path)
+
+
+def cleanup_expired_exports() -> None:
+    now = time.monotonic()
+    with PENDING_EXPORTS_LOCK:
+        expired_archives = [
+            PENDING_EXPORTS.pop(download_id)[0]
+            for download_id, (_, expires_at) in list(PENDING_EXPORTS.items())
+            if expires_at <= now
+        ]
+    for archive_path in expired_archives:
+        _remove_export_archive(archive_path)
+
+
+def cleanup_residual_export_artifacts(export_dir: str) -> None:
+    with PENDING_EXPORTS_LOCK:
+        protected_dirs = {
+            os.path.dirname(archive_path)
+            for archive_path, _ in PENDING_EXPORTS.values()
+        } | {os.path.dirname(archive_path) for archive_path in ACTIVE_DOWNLOAD_ARCHIVES}
+    try:
+        entries = list(os.scandir(export_dir))
+    except OSError as ex:
+        log.warning("Unable to inspect export directory: {}".format(ex))
+        return
+    for entry in entries:
+        if entry.name.startswith(".winscope-export-") and entry.path not in protected_dirs:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.path)
+            except OSError as ex:
+                log.warning("Unable to remove residual export directory: {}".format(ex))
+
+
+def register_pending_export(download_id: str, archive_path: os.PathLike[str] | str, expires_at: float) -> None:
+    with PENDING_EXPORTS_LOCK:
+        PENDING_EXPORTS[download_id] = (os.fspath(archive_path), expires_at)
+
+
+def create_pending_export(archive_path: str) -> str:
+    expires_at = time.monotonic() + EXPORT_TTL_S
+    while True:
+        download_id = secrets.token_urlsafe(32)
+        with PENDING_EXPORTS_LOCK:
+            if download_id not in PENDING_EXPORTS:
+                PENDING_EXPORTS[download_id] = (archive_path, expires_at)
+                return download_id
+
+
+def take_pending_export(download_id: str) -> str | None:
+    cleanup_expired_exports()
+    expired_archive = None
+    with PENDING_EXPORTS_LOCK:
+        entry = PENDING_EXPORTS.get(download_id)
+        if not entry:
+            return None
+        archive_path, expires_at = entry
+        PENDING_EXPORTS.pop(download_id)
+        if expires_at <= time.monotonic():
+            expired_archive = archive_path
+        else:
+            ACTIVE_DOWNLOAD_ARCHIVES.add(archive_path)
+    if expired_archive:
+        _remove_export_archive(expired_archive)
+        return None
+    return archive_path
+
+
+def clear_pending_exports() -> None:
+    with PENDING_EXPORTS_LOCK:
+        archive_paths = [archive_path for archive_path, _ in PENDING_EXPORTS.values()]
+        archive_paths.extend(ACTIVE_DOWNLOAD_ARCHIVES)
+        PENDING_EXPORTS.clear()
+    for archive_path in set(archive_paths):
+        _remove_export_archive(archive_path)
+    try:
+        cleanup_residual_export_artifacts(get_export_dir())
+    except BadRequest:
+        pass
+
+
+class ExportZipEndpoint(DeviceRequestEndpoint):
+    def process_with_device(self, server, path, device_id):
+        request = self.get_request(server)
+        remote_path = request.get("remotePath") if isinstance(request, dict) else None
+        if not isinstance(remote_path, str) or not remote_path.startswith("/") or "\x00" in remote_path:
+            raise BadRequest("remotePath must be an absolute path without NUL")
+        if not EXPORT_SEMAPHORE.acquire(blocking=False):
+            raise BadRequest("Too many concurrent export requests")
+
+        work_dir = None
+        download_id = None
+        try:
+            export_dir = get_export_dir()
+            cleanup_expired_exports()
+            cleanup_residual_export_artifacts(export_dir)
+            work_dir = mkdtemp(prefix=".winscope-export-", dir=export_dir)
+            archive_path = os.path.join(work_dir, "archive.zip")
+            command = [
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "winscope_export.sh")),
+                "--serial", device_id,
+                "--remote-path", remote_path,
+                "--output", archive_path,
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=EXPORT_TIMEOUT_S,
+                    check=False,
+                    shell=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as ex:
+                raise ExportError("Export command failed") from ex
+            if result.returncode != 0 or not os.path.isfile(archive_path):
+                raise ExportError("Export command failed")
+            download_id = create_pending_export(archive_path)
+            work_dir = None
+            try:
+                server.respond(
+                    HTTPStatus.OK,
+                    json.dumps({"downloadUrl": "/download/" + download_id}).encode("utf-8"),
+                    "text/json",
+                )
+            except Exception:
+                archive_path = take_pending_export(download_id)
+                if archive_path:
+                    _remove_export_archive(archive_path)
+                raise
+        finally:
+            if work_dir:
+                _remove_export_archive(os.path.join(work_dir, "archive.zip"))
+            EXPORT_SEMAPHORE.release()
+
+
+class DownloadEndpoint(RequestEndpoint):
+    requires_token = False
+
+    def process(self, server, path):
+        if len(path) != 1:
+            raise BadRequest("Download id not specified")
+        archive_path = take_pending_export(path[0])
+        if not archive_path:
+            raise BadRequest("Download is unavailable")
+        response_started = False
+        try:
+            archive_size = os.path.getsize(archive_path)
+            server.send_response(HTTPStatus.OK)
+            server.send_header("Content-type", "application/zip")
+            server.send_header("Content-Disposition", "attachment; filename=\"winscope-export.zip\"")
+            server.send_header("Content-Length", str(archive_size))
+            if hasattr(server, "add_standard_headers"):
+                server.add_standard_headers()
+            else:
+                server.end_headers()
+            response_started = True
+            with open(archive_path, "rb") as archive_file:
+                while chunk := archive_file.read(64 * 1024):
+                    server.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout) as ex:
+            if response_started:
+                log.warning("Client disconnected while downloading export: {}".format(ex))
+                return
+            raise ExportError("Unable to download archive") from ex
+        except OSError as ex:
+            raise ExportError("Unable to download archive") from ex
+        finally:
+            _remove_export_archive(archive_path)
+
+
 
 class TraceThread(threading.Thread):
     def __init__(self, target_id: str, device_id: str, start_command: str, stop_command: str):
@@ -588,6 +816,7 @@ def stop_active_traces():
 
     with TRACE_THREADS_LOCK:
         TRACE_THREADS.clear()
+    clear_pending_exports()
 
 
 def stop_active_fetches():
@@ -721,11 +950,15 @@ class ADBWinscopeProxy(BaseHTTPRequestHandler):
         self.router.register_endpoint(
             RequestType.GET, "fetch", FetchEndpoint())
         self.router.register_endpoint(
+            RequestType.GET, "download", DownloadEndpoint())
+        self.router.register_endpoint(
             RequestType.POST, "runadbcmd", RunAdbCmdEndpoint())
         self.router.register_endpoint(
             RequestType.POST, "starttrace", StartTraceEndpoint())
         self.router.register_endpoint(
             RequestType.POST, "endtrace", EndTraceEndpoint())
+        self.router.register_endpoint(
+            RequestType.POST, "exportzip", ExportZipEndpoint())
         super().__init__(request, client_address, server)
 
     def respond(self, code: int, data: bytes, mime: str) -> None:
@@ -764,6 +997,10 @@ class ADBWinscopeProxy(BaseHTTPRequestHandler):
 
 class LoopbackHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+
+    def server_close(self):
+        clear_pending_exports()
+        super().server_close()
 
 
 def create_http_server(port: int) -> ThreadingHTTPServer:
