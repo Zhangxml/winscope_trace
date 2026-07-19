@@ -4,3 +4,7 @@ runtime/
 # Python 字节码缓存
 __pycache__/
 *.py[cod]
+
+# 本地文档和测试用例
+docs/
+tests/
