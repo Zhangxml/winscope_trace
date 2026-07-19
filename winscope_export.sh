@@ -11,6 +11,14 @@ fail() {
     exit 2
 }
 
+validate_value() {
+    case "$2" in
+        ''|--*|*[[:cntrl:]]*)
+            fail "$1 参数无效"
+            ;;
+    esac
+}
+
 serial=''
 remote_path=''
 output=''
@@ -22,6 +30,7 @@ while (($#)); do
     case "$1" in
         --serial)
             (($# >= 2)) || fail '--serial 缺少参数'
+            validate_value "$1" "$2"
             [[ $serial_seen == false ]] || fail '--serial 只能指定一次'
             serial=$2
             serial_seen=true
@@ -29,6 +38,7 @@ while (($#)); do
             ;;
         --remote-path)
             (($# >= 2)) || fail '--remote-path 缺少参数'
+            validate_value "$1" "$2"
             [[ $remote_path_seen == false ]] || fail '--remote-path 只能指定一次'
             remote_path=$2
             remote_path_seen=true
@@ -36,6 +46,7 @@ while (($#)); do
             ;;
         --output)
             (($# >= 2)) || fail '--output 缺少参数'
+            validate_value "$1" "$2"
             [[ $output_seen == false ]] || fail '--output 只能指定一次'
             output=$2
             output_seen=true
@@ -58,7 +69,7 @@ output_dir=$(dirname -- "$output")
 
 trace_name=$(basename -- "$remote_path")
 case "$trace_name" in
-    ''|.|..|/*|*'\'*|*[[:cntrl:]]*)
+    ''|.|..|/*|*'\'*|*:*|*[[:cntrl:]]*)
         fail '最终文件名不安全'
         ;;
 esac
