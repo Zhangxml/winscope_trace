@@ -88,7 +88,10 @@ MAX_CONCURRENT_EXPORTS = 1
 EXPORT_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_EXPORTS)
 PENDING_EXPORTS: dict[str, tuple[str, float]] = {}
 PENDING_EXPORTS_LOCK = threading.Lock()
+PENDING_EXPORT_TIMERS: dict[str, threading.Timer] = {}
 ACTIVE_DOWNLOAD_ARCHIVES: set[str] = set()
+ACTIVE_EXPORT_PROCESSES: dict[subprocess.Popen, str] = {}
+ACTIVE_EXPORT_PROCESSES_LOCK = threading.Lock()
 
 
 class Base64JsonWriter(io.RawIOBase):
@@ -480,15 +483,32 @@ def _remove_export_archive(archive_path: str) -> None:
             ACTIVE_DOWNLOAD_ARCHIVES.discard(archive_path)
 
 
+def _cancel_export_timer(timer) -> None:
+    if timer:
+        timer.cancel()
+
+
+def _expire_pending_export(download_id: str, expires_at: float) -> None:
+    with PENDING_EXPORTS_LOCK:
+        entry = PENDING_EXPORTS.get(download_id)
+        if not entry or entry[1] != expires_at:
+            return
+        archive_path = PENDING_EXPORTS.pop(download_id)[0]
+        timer = PENDING_EXPORT_TIMERS.pop(download_id, None)
+    _cancel_export_timer(timer)
+    _remove_export_archive(archive_path)
+
+
 def cleanup_expired_exports() -> None:
     now = time.monotonic()
     with PENDING_EXPORTS_LOCK:
-        expired_archives = [
-            PENDING_EXPORTS.pop(download_id)[0]
+        expired_exports = [
+            (PENDING_EXPORTS.pop(download_id)[0], PENDING_EXPORT_TIMERS.pop(download_id, None))
             for download_id, (_, expires_at) in list(PENDING_EXPORTS.items())
             if expires_at <= now
         ]
-    for archive_path in expired_archives:
+    for archive_path, timer in expired_exports:
+        _cancel_export_timer(timer)
         _remove_export_archive(archive_path)
 
 
@@ -513,8 +533,25 @@ def cleanup_residual_export_artifacts(export_dir: str) -> None:
 
 
 def register_pending_export(download_id: str, archive_path: os.PathLike[str] | str, expires_at: float) -> None:
+    archive_path = os.fspath(archive_path)
+    timer = threading.Timer(
+        max(0, expires_at - time.monotonic()),
+        _expire_pending_export,
+        args=(download_id, expires_at),
+    )
+    timer.daemon = True
     with PENDING_EXPORTS_LOCK:
-        PENDING_EXPORTS[download_id] = (os.fspath(archive_path), expires_at)
+        old_entry = PENDING_EXPORTS.get(download_id)
+        old_timer = PENDING_EXPORT_TIMERS.get(download_id)
+        PENDING_EXPORTS[download_id] = (archive_path, expires_at)
+        PENDING_EXPORT_TIMERS[download_id] = timer
+    _cancel_export_timer(old_timer)
+    if old_entry and old_entry[0] != archive_path:
+        _remove_export_archive(old_entry[0])
+    if expires_at <= time.monotonic():
+        _expire_pending_export(download_id, expires_at)
+    else:
+        timer.start()
 
 
 def create_pending_export(archive_path: str) -> str:
@@ -523,23 +560,27 @@ def create_pending_export(archive_path: str) -> str:
         download_id = secrets.token_urlsafe(32)
         with PENDING_EXPORTS_LOCK:
             if download_id not in PENDING_EXPORTS:
-                PENDING_EXPORTS[download_id] = (archive_path, expires_at)
-                return download_id
+                break
+    register_pending_export(download_id, archive_path, expires_at)
+    return download_id
 
 
 def take_pending_export(download_id: str) -> str | None:
     cleanup_expired_exports()
     expired_archive = None
+    timer = None
     with PENDING_EXPORTS_LOCK:
         entry = PENDING_EXPORTS.get(download_id)
         if not entry:
             return None
         archive_path, expires_at = entry
         PENDING_EXPORTS.pop(download_id)
+        timer = PENDING_EXPORT_TIMERS.pop(download_id, None)
         if expires_at <= time.monotonic():
             expired_archive = archive_path
         else:
             ACTIVE_DOWNLOAD_ARCHIVES.add(archive_path)
+    _cancel_export_timer(timer)
     if expired_archive:
         _remove_export_archive(expired_archive)
         return None
@@ -550,13 +591,50 @@ def clear_pending_exports() -> None:
     with PENDING_EXPORTS_LOCK:
         archive_paths = [archive_path for archive_path, _ in PENDING_EXPORTS.values()]
         archive_paths.extend(ACTIVE_DOWNLOAD_ARCHIVES)
+        timers = list(PENDING_EXPORT_TIMERS.values())
         PENDING_EXPORTS.clear()
+        PENDING_EXPORT_TIMERS.clear()
+    for timer in timers:
+        _cancel_export_timer(timer)
     for archive_path in set(archive_paths):
         _remove_export_archive(archive_path)
     try:
         cleanup_residual_export_artifacts(get_export_dir())
     except BadRequest:
         pass
+
+
+def call_export(command: list[str], work_dir: str) -> None:
+    process = None
+    try:
+        with ACTIVE_EXPORT_PROCESSES_LOCK:
+            if SHUTTING_DOWN.is_set():
+                raise ExportError("Proxy is shutting down")
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+            )
+            ACTIVE_EXPORT_PROCESSES[process] = work_dir
+        try:
+            process.communicate(timeout=EXPORT_TIMEOUT_S)
+        except subprocess.TimeoutExpired as ex:
+            process.kill()
+            process.communicate()
+            raise ExportError("Export command timed out") from ex
+        if process.returncode != 0:
+            raise ExportError("Export command failed")
+    except OSError as ex:
+        raise ExportError("Export command failed") from ex
+    finally:
+        if process:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            with ACTIVE_EXPORT_PROCESSES_LOCK:
+                ACTIVE_EXPORT_PROCESSES.pop(process, None)
+
 
 
 class ExportZipEndpoint(DeviceRequestEndpoint):
@@ -582,18 +660,8 @@ class ExportZipEndpoint(DeviceRequestEndpoint):
                 "--remote-path", remote_path,
                 "--output", archive_path,
             ]
-            try:
-                result = subprocess.run(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=EXPORT_TIMEOUT_S,
-                    check=False,
-                    shell=False,
-                )
-            except (OSError, subprocess.TimeoutExpired) as ex:
-                raise ExportError("Export command failed") from ex
-            if result.returncode != 0 or not os.path.isfile(archive_path):
+            call_export(command, work_dir)
+            if not os.path.isfile(archive_path):
                 raise ExportError("Export command failed")
             download_id = create_pending_export(archive_path)
             work_dir = None
@@ -803,6 +871,7 @@ def stop_active_traces():
         ]
 
     stop_active_fetches()
+    stop_active_exports()
 
     stop_workers = [
         threading.Thread(target=thread.end_trace, daemon=True)
@@ -830,6 +899,31 @@ def stop_active_fetches():
     with ACTIVE_FETCH_PROCESSES_LOCK:
         for process in active_processes:
             ACTIVE_FETCH_PROCESSES.discard(process)
+
+
+def stop_active_exports():
+    with ACTIVE_EXPORT_PROCESSES_LOCK:
+        active_processes = list(ACTIVE_EXPORT_PROCESSES.items())
+    for process, _ in active_processes:
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except OSError as ex:
+            log.warning("Unable to terminate export process: {}".format(ex))
+    for process, work_dir in active_processes:
+        try:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=COMMAND_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        except OSError as ex:
+            log.warning("Unable to stop export process: {}".format(ex))
+        finally:
+            _remove_export_archive(os.path.join(work_dir, "archive.zip"))
+            with ACTIVE_EXPORT_PROCESSES_LOCK:
+                ACTIVE_EXPORT_PROCESSES.pop(process, None)
 
 class StartTraceEndpoint(DeviceRequestEndpoint):
     def process_with_device(self, server, path, device_id):
