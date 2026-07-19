@@ -82,6 +82,7 @@
       exportInProgress = true;
       submitButton.disabled = true;
       showMessage('正在导出，请稍候…');
+      let downloadStarted = false;
       try {
         const response = await fetch(proxyUrl + '/exportzip/' + encodeURIComponent(serial), {
           method: 'POST',
@@ -102,11 +103,15 @@
           return;
         }
         window.location.assign(proxyUrl + downloadUrl);
+        downloadStarted = true;
+        showMessage('下载已开始，如需再次导出请刷新页面');
       } catch (error) {
         showMessage(`请求失败：${error.message}`);
       } finally {
-        exportInProgress = false;
-        submitButton.disabled = false;
+        if (!downloadStarted) {
+          exportInProgress = false;
+          submitButton.disabled = false;
+        }
       }
     });
   </script>
