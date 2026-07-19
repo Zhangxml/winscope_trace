@@ -110,7 +110,7 @@ done
 
 readonly ui_dir="$install_root/vendor/winscope-ui"
 readonly proxy_path="$install_root/vendor/winscope-proxy/winscope_proxy.py"
-readonly runtime_dir="$install_root/winscope-aosp/runtime"
+readonly runtime_dir="$install_root/runtime"
 readonly webui_log="$runtime_dir/webui.log"
 readonly proxy_log="$runtime_dir/proxy.log"
 readonly token_file="$runtime_dir/.token"

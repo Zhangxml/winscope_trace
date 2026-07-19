@@ -1,5 +1,5 @@
 # 本机运行时生成的 Token 与日志
-winscope-aosp/runtime/
+runtime/
 
 # Python 字节码缓存
 __pycache__/

@@ -46,14 +46,13 @@ winscope_trace/
 │   ├── winscope-ui/                 # 官方 Winscope Web UI 静态产物
 │   └── winscope-proxy/
 │       └── winscope_proxy.py        # 打包后的 Winscope ADB Proxy
-└── winscope-aosp/
-    └── runtime/                     # 运行时生成的 Token 和日志
-        ├── .token
-        ├── proxy.log
-        └── webui.log
+└── runtime/                          # 运行时生成的 Token 和日志
+    ├── .token
+    ├── proxy.log
+    └── webui.log
 ```
 
-`winscope-aosp/runtime/` 是运行时目录，不包含 AOSP 源码。Token 文件权限由 Proxy 设置为仅当前用户可读写。
+`runtime/` 是运行时目录，存放本地 Web UI 和 Proxy 的日志及 Token。Token 文件权限由 Proxy 设置为仅当前用户可读写。
 
 ## 实现方式
 
@@ -72,7 +71,7 @@ python3 -m http.server 8080 --bind 127.0.0.1 --directory vendor/winscope-ui
 脚本同时启动：
 
 ```bash
-WINSCOPE_TOKEN_LOCATION=winscope-aosp/runtime/.token \
+WINSCOPE_TOKEN_LOCATION=runtime/.token \
 python3 vendor/winscope-proxy/winscope_proxy.py -p 5544
 ```
 
@@ -131,7 +130,7 @@ cd /path/to/winscope_trace
 UI:         http://127.0.0.1:8080
 Proxy:      http://127.0.0.1:5544
 Token:      <随机 Token>
-Runtime:    /path/to/winscope_trace/winscope-aosp/runtime
+Runtime:    /path/to/winscope_trace/runtime
 ```
 
 按 `Ctrl+C` 会同时停止本地 Web UI 服务和 Proxy。
@@ -244,6 +243,6 @@ adb -s <serial> shell cmd window tracing status
 详细运行日志位于：
 
 ```text
-winscope-aosp/runtime/proxy.log
-winscope-aosp/runtime/webui.log
+runtime/proxy.log
+runtime/webui.log
 ```
