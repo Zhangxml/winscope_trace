@@ -8,3 +8,6 @@ __pycache__/
 # 本地文档和测试用例
 docs/
 tests/
+
+# 本地隔离工作区
+.worktrees/
