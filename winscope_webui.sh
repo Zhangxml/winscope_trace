@@ -114,6 +114,9 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
+[[ -d "$install_root" ]] || error "--root 不是目录: $install_root"
+install_root="$(cd -- "$install_root" && pwd -P)"
+
 is_valid_port "$ui_port" || error "无效 UI 端口: $ui_port"
 is_valid_port "$proxy_port" || error "无效 Proxy 端口: $proxy_port"
 
@@ -124,6 +127,7 @@ done
 readonly ui_dir="$install_root/vendor/winscope-ui"
 readonly proxy_path="$install_root/vendor/winscope-proxy/winscope_proxy.py"
 readonly runtime_dir="$install_root/runtime"
+readonly export_dir="$runtime_dir/downloads"
 readonly webui_log="$runtime_dir/webui.log"
 readonly proxy_log="$runtime_dir/proxy.log"
 readonly token_file="$runtime_dir/.token"
@@ -136,6 +140,9 @@ is_port_free "$proxy_port" || error "Proxy 端口已被占用: $proxy_port，可
 
 mkdir -p "$runtime_dir"
 chmod 700 "$runtime_dir"
+mkdir -p "$export_dir"
+chmod 700 "$export_dir"
+find -P "$export_dir" -mindepth 1 -maxdepth 1 -name '.winscope-export-*' -exec rm -rf -- {} +
 rm -f "$webui_log" "$proxy_log"
 
 trap cleanup EXIT INT TERM
@@ -154,7 +161,7 @@ for ((attempt = 0; attempt < 50; attempt++)); do
 done
 is_port_free "$ui_port" && error "Winscope Web UI 未监听端口 $ui_port，请查看: $webui_log"
 
-WINSCOPE_TOKEN_LOCATION="$token_file" python3 "$proxy_path" -p "$proxy_port" > "$proxy_log" 2>&1 &
+WINSCOPE_EXPORT_DIR="$export_dir" WINSCOPE_TOKEN_LOCATION="$token_file" python3 "$proxy_path" -p "$proxy_port" > "$proxy_log" 2>&1 &
 proxy_pid=$!
 
 token=""
@@ -178,6 +185,7 @@ printf '\n=============================================\n'
 printf 'Winscope Web UI 已启动，按 Ctrl+C 停止服务\n'
 printf '=============================================\n'
 printf 'UI:         http://127.0.0.1:%s\n' "$ui_port"
+printf '导出:       http://127.0.0.1:%s/winscope-export.html?proxyPort=%s\n' "$ui_port" "$proxy_port"
 printf 'Proxy:      http://127.0.0.1:%s\n' "$proxy_port"
 printf 'Token:      %s\n' "$token"
 printf 'Runtime:    %s\n' "$runtime_dir"

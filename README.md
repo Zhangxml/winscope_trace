@@ -97,7 +97,7 @@ TimeoutExpired(['adb', '-s', '<serial>', 'shell'], 15)
 2. 结束抓取、保活超时或 Proxy 收到终止信号时，直接执行对应的 `stopCmd`，且每条 trace 只会停止一次。脚本等待最多 35 秒完成优雅停止，超时后终止本地 Proxy。
 3. Trace 启停和普通 ADB 命令均应用 15 秒超时；浏览器 Proxy 的大文件 fetch 使用 10 分钟总时限与 30 秒无数据时限。非零退出会返回明确错误，避免把失败文本当作成功结果。
 4. 每个运行中的 trace 需要 Web UI 持续调用 `/status` 保活；连续 30 秒没有收到保活请求时，Proxy 自动执行该 trace 的 `stopCmd`。
-5. 单次文件拉取上限为 200 MiB，同一时刻只处理一个拉取请求；超过限制会被拒绝。文件先写入临时文件，再流式 gzip/Base64 编码为响应，避免为大文件同时保留多个完整内存副本。
+5. 单次文件拉取上限为 375 MiB，同一时刻只处理一个拉取请求；该值为浏览器端 Base64/Gzip 单字符串响应预留约 12 MiB 安全余量，超过限制会被拒绝。文件先写入临时文件，再流式 gzip/Base64 编码为响应，避免为大文件同时保留多个完整内存副本。
 
 这样可确保 WindowManager trace、`screenrecord` 和 detached Perfetto session 在结束时执行真实的设备侧清理命令。
 

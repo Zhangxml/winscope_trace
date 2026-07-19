@@ -114,11 +114,7 @@ def adb_exec_out_args(serial: str, remote_path: str, offset: int) -> list[str]:
         "-s",
         serial,
         "exec-out",
-        "su",
-        "root",
-        "sh",
-        "-c",
-        dd_command(remote_path, offset),
+        resume_dd_command(remote_path, offset),
     ]
 
 

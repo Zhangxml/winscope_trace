@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Winscope 最近会话导出</title>
+  <style>
+    body { max-width: 42rem; margin: 3rem auto; padding: 0 1rem; color: #202124; font: 16px/1.5 sans-serif; }
+    label { display: block; margin-top: 1rem; font-weight: 600; }
+    input, select { box-sizing: border-box; width: 100%; margin-top: .25rem; padding: .5rem; font: inherit; }
+    button { margin-top: 1.5rem; padding: .55rem 1rem; font: inherit; }
+    #device-picker { display: none; }
+    #message { min-height: 1.5rem; margin-top: 1rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Winscope 最近会话导出</h1>
+  <p>输入 Token 后即可导出最近一次 Winscope 抓取会话。</p>
+  <form id="export-form">
+    <label>Token
+      <input id="token" type="password" required autocomplete="off">
+    </label>
+    <div id="device-picker"></div>
+    <button id="export-button" type="submit">导出并下载</button>
+  </form>
+  <p id="message" role="status" aria-live="polite"></p>
+  <script>
+    const DEFAULT_PROXY_PORT = '5544';
+    const form = document.getElementById('export-form');
+    const message = document.getElementById('message');
+    const submitButton = document.getElementById('export-button');
+    const devicePicker = document.getElementById('device-picker');
+    const proxyPort = new URLSearchParams(window.location.search).get('proxyPort');
+    let exportInProgress = false;
+    let deviceSelect = null;
+
+    function showMessage(text) {
+      message.textContent = text;
+    }
+
+    function proxyUrlFromPort(port) {
+      if (port === null) {
+        return `http://127.0.0.1:${DEFAULT_PROXY_PORT}`;
+      }
+      if (!/^[1-9][0-9]*$/.test(port) || Number(port) > 65535) {
+        return null;
+      }
+      return `http://127.0.0.1:${port}`;
+    }
+
+    const proxyUrl = proxyUrlFromPort(proxyPort);
+    if (!proxyUrl) {
+      submitButton.disabled = true;
+      showMessage('Proxy 端口配置错误：proxyPort 必须是 1 到 65535 的十进制整数。');
+    }
+
+    function requestOptions(token, method) {
+      return {
+        method,
+        redirect: 'error',
+        headers: { 'Winscope-Token': token },
+      };
+    }
+
+    async function readResponseError(response) {
+      const detail = await response.text();
+      return detail || `请求失败（HTTP ${response.status}）。`;
+    }
+
+    function showDevicePicker(devices) {
+      const label = document.createElement('label');
+      label.textContent = '选择设备';
+      deviceSelect = document.createElement('select');
+      deviceSelect.required = true;
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = '请选择要导出的设备';
+      placeholder.disabled = true;
+      placeholder.selected = true;
+      deviceSelect.appendChild(placeholder);
+      for (const device of devices) {
+        const option = document.createElement('option');
+        option.value = device.id;
+        option.textContent = device.model ? `${device.model} (${device.id})` : device.id;
+        deviceSelect.appendChild(option);
+      }
+      label.appendChild(deviceSelect);
+      devicePicker.replaceChildren(label);
+      devicePicker.style.display = 'block';
+      showMessage('检测到多个已授权设备，请选择设备后再次点击导出。');
+    }
+
+    async function startDownload(device, token) {
+      const response = await fetch(
+          proxyUrl + '/exportsession/' + encodeURIComponent(device.id),
+          requestOptions(token, 'POST'));
+      if (!response.ok) {
+        showMessage(await readResponseError(response));
+        return false;
+      }
+      const { downloadUrl } = await response.json();
+      if (typeof downloadUrl !== 'string' || !downloadUrl.startsWith('/download/')) {
+        showMessage('Proxy 返回了无效的下载地址。');
+        return false;
+      }
+      window.location.assign(proxyUrl + downloadUrl);
+      showMessage('下载已开始，如需再次导出请刷新页面。');
+      return true;
+    }
+
+    async function listAuthorizedDevices(token) {
+      const response = await fetch(proxyUrl + '/devices', requestOptions(token, 'GET'));
+      if (!response.ok) {
+        showMessage(await readResponseError(response));
+        return null;
+      }
+      const devices = await response.json();
+      if (!Array.isArray(devices)) {
+        showMessage('Proxy 返回了无效的设备列表。');
+        return null;
+      }
+      return devices.filter(
+          (device) => device && device.authorized === true && typeof device.id === 'string');
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (exportInProgress || !proxyUrl) {
+        return;
+      }
+      const token = document.getElementById('token').value;
+      if (!token) {
+        showMessage('请输入 Token。');
+        return;
+      }
+
+      exportInProgress = true;
+      submitButton.disabled = true;
+      showMessage('正在导出，请稍候…');
+      let downloadStarted = false;
+      try {
+        if (deviceSelect) {
+          if (!deviceSelect.value) {
+            showMessage('请选择要导出的设备。');
+            return;
+          }
+          downloadStarted = await startDownload({ id: deviceSelect.value }, token);
+          return;
+        }
+
+        const devices = await listAuthorizedDevices(token);
+        if (devices === null) {
+          return;
+        }
+        if (devices.length === 0) {
+          showMessage('没有已授权的 adb 设备可导出。');
+          return;
+        }
+        if (devices.length === 1) {
+          downloadStarted = await startDownload(devices[0], token);
+          return;
+        }
+        showDevicePicker(devices);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        showMessage(`请求失败：${detail}`);
+      } finally {
+        if (!downloadStarted) {
+          exportInProgress = false;
+          submitButton.disabled = false;
+        }
+      }
+    });
+  </script>
+</body>
+</html>
