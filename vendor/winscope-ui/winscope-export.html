@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Winscope ZIP 导出</title>
+  <style>
+    body { max-width: 42rem; margin: 3rem auto; padding: 0 1rem; color: #202124; font: 16px/1.5 sans-serif; }
+    label { display: block; margin-top: 1rem; font-weight: 600; }
+    input { box-sizing: border-box; width: 100%; margin-top: .25rem; padding: .5rem; font: inherit; }
+    button { margin-top: 1.5rem; padding: .55rem 1rem; font: inherit; }
+    #message { min-height: 1.5rem; margin-top: 1rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Winscope ZIP 导出</h1>
+  <p>导出完成后将由浏览器直接下载 ZIP 文件。</p>
+  <form id="export-form">
+    <label>Proxy 地址
+      <input id="proxy-url" type="url" required value="http://127.0.0.1:5544">
+    </label>
+    <label>Token
+      <input id="token" type="password" required autocomplete="off">
+    </label>
+    <label>设备序列号
+      <input id="serial" type="text" required>
+    </label>
+    <label>绝对远端路径
+      <input id="remote-path" type="text" required placeholder="/data/misc/wmtrace/wm_trace.winscope">
+    </label>
+    <button type="submit">导出并下载</button>
+  </form>
+  <p id="message" role="status" aria-live="polite"></p>
+  <script>
+    const form = document.getElementById('export-form');
+    const message = document.getElementById('message');
+
+    function showMessage(text) {
+      message.textContent = text;
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const proxyUrl = document.getElementById('proxy-url').value.trim().replace(/\/+$/, '');
+      const token = document.getElementById('token').value;
+      const serial = document.getElementById('serial').value.trim();
+      const remotePath = document.getElementById('remote-path').value.trim();
+      if (!proxyUrl || !token || !serial || !remotePath.startsWith('/')) {
+        showMessage('请填写全部字段，且远端路径必须为绝对路径。');
+        return;
+      }
+
+      showMessage('正在导出，请稍候…');
+      try {
+        const response = await fetch(proxyUrl + '/exportzip/' + encodeURIComponent(serial), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Winscope-Token': token,
+          },
+          body: JSON.stringify({ remotePath }),
+        });
+        if (!response.ok) {
+          showMessage(await response.text());
+          return;
+        }
+        const { downloadUrl } = await response.json();
+        if (typeof downloadUrl !== 'string' || !downloadUrl.startsWith('/download/')) {
+          showMessage('Proxy 返回了无效的下载地址。');
+          return;
+        }
+        window.location.assign(proxyUrl + downloadUrl);
+      } catch (error) {
+        showMessage(`请求失败：${error.message}`);
+      }
+    });
+  </script>
+</body>
+</html>
