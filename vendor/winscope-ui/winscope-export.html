@@ -28,28 +28,59 @@
     <label>绝对远端路径
       <input id="remote-path" type="text" required placeholder="/data/misc/wmtrace/wm_trace.winscope">
     </label>
-    <button type="submit">导出并下载</button>
+    <button id="export-button" type="submit">导出并下载</button>
   </form>
   <p id="message" role="status" aria-live="polite"></p>
   <script>
     const form = document.getElementById('export-form');
     const message = document.getElementById('message');
+    const submitButton = document.getElementById('export-button');
+    let exportInProgress = false;
 
     function showMessage(text) {
       message.textContent = text;
     }
 
+    function parseProxyUrl(value) {
+      let parsed;
+      try {
+        parsed = new URL(value);
+      } catch {
+        return null;
+      }
+      const addressMatch = /^http:\/\/127\.0\.0\.1(?::([1-9][0-9]*))?\/?$/.exec(value);
+      if (!addressMatch || parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1'
+          || parsed.username || parsed.password || parsed.pathname !== '/'
+          || parsed.search || parsed.hash) {
+        return null;
+      }
+      const port = addressMatch[1] || '5544';
+      if (Number(port) > 65535) {
+        return null;
+      }
+      return `http://127.0.0.1:${port}`;
+    }
+
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const proxyUrl = document.getElementById('proxy-url').value.trim().replace(/\/+$/, '');
+      if (exportInProgress) {
+        return;
+      }
+      const proxyUrl = parseProxyUrl(document.getElementById('proxy-url').value.trim());
       const token = document.getElementById('token').value;
       const serial = document.getElementById('serial').value.trim();
       const remotePath = document.getElementById('remote-path').value.trim();
-      if (!proxyUrl || !token || !serial || !remotePath.startsWith('/')) {
+      if (!proxyUrl) {
+        showMessage('Proxy 地址必须是 http://127.0.0.1:<端口>。');
+        return;
+      }
+      if (!token || !serial || !remotePath.startsWith('/')) {
         showMessage('请填写全部字段，且远端路径必须为绝对路径。');
         return;
       }
 
+      exportInProgress = true;
+      submitButton.disabled = true;
       showMessage('正在导出，请稍候…');
       try {
         const response = await fetch(proxyUrl + '/exportzip/' + encodeURIComponent(serial), {
@@ -72,6 +103,9 @@
         window.location.assign(proxyUrl + downloadUrl);
       } catch (error) {
         showMessage(`请求失败：${error.message}`);
+      } finally {
+        exportInProgress = false;
+        submitButton.disabled = false;
       }
     });
   </script>

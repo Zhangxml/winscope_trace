@@ -139,6 +139,7 @@ mkdir -p "$runtime_dir"
 chmod 700 "$runtime_dir"
 mkdir -p "$export_dir"
 chmod 700 "$export_dir"
+find -P "$export_dir" -mindepth 1 -maxdepth 1 -name '.winscope-export-*' -exec rm -rf -- {} +
 rm -f "$webui_log" "$proxy_log"
 
 trap cleanup EXIT INT TERM
