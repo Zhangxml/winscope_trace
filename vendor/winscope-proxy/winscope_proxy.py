@@ -722,6 +722,7 @@ class DownloadEndpoint(RequestEndpoint):
         try:
             archive_size = os.path.getsize(archive_path)
             server.send_response(HTTPStatus.OK)
+            response_started = True
             server.send_header("Content-type", "application/zip")
             server.send_header("Content-Disposition", "attachment; filename=\"winscope-export.zip\"")
             server.send_header("Content-Length", str(archive_size))
@@ -729,16 +730,13 @@ class DownloadEndpoint(RequestEndpoint):
                 server.add_standard_headers()
             else:
                 server.end_headers()
-            response_started = True
             with open(archive_path, "rb") as archive_file:
                 while chunk := archive_file.read(64 * 1024):
                     server.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError, socket.timeout) as ex:
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError) as ex:
             if response_started:
-                log.warning("Client disconnected while downloading export: {}".format(ex))
+                log.warning("Unable to stream download after response: {}".format(ex))
                 return
-            raise ExportError("Unable to download archive") from ex
-        except OSError as ex:
             raise ExportError("Unable to download archive") from ex
         finally:
             _remove_export_archive(archive_path)
