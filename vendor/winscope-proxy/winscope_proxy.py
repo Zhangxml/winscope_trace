@@ -533,6 +533,17 @@ def cleanup_residual_export_artifacts(export_dir: str) -> None:
                 log.warning("Unable to remove residual export directory: {}".format(ex))
 
 
+def _ensure_export_slot_available_locked() -> None:
+    if PENDING_EXPORTS or ACTIVE_DOWNLOAD_ARCHIVES:
+        raise BadRequest("An export archive is already pending")
+
+
+def ensure_export_slot_available() -> None:
+    with PENDING_EXPORTS_LOCK:
+        _ensure_export_slot_available_locked()
+
+
+
 def register_pending_export(download_id: str, archive_path: os.PathLike[str] | str, expires_at: float) -> None:
     archive_path = os.fspath(archive_path)
     timer = threading.Timer(
@@ -542,13 +553,9 @@ def register_pending_export(download_id: str, archive_path: os.PathLike[str] | s
     )
     timer.daemon = True
     with PENDING_EXPORTS_LOCK:
-        old_entry = PENDING_EXPORTS.get(download_id)
-        old_timer = PENDING_EXPORT_TIMERS.get(download_id)
+        _ensure_export_slot_available_locked()
         PENDING_EXPORTS[download_id] = (archive_path, expires_at)
         PENDING_EXPORT_TIMERS[download_id] = timer
-    _cancel_export_timer(old_timer)
-    if old_entry and old_entry[0] != archive_path:
-        _remove_export_archive(old_entry[0])
     if expires_at <= time.monotonic():
         _expire_pending_export(download_id, expires_at)
     else:
@@ -560,6 +567,7 @@ def create_pending_export(archive_path: str) -> str:
     with PENDING_EXPORTS_LOCK:
         if SHUTTING_DOWN.is_set():
             raise ExportError("Proxy is shutting down")
+        _ensure_export_slot_available_locked()
         while True:
             download_id = secrets.token_urlsafe(32)
             if download_id not in PENDING_EXPORTS:
@@ -679,6 +687,7 @@ class ExportZipEndpoint(DeviceRequestEndpoint):
         try:
             export_dir = get_export_dir()
             cleanup_expired_exports()
+            ensure_export_slot_available()
             cleanup_residual_export_artifacts(export_dir)
             work_dir = mkdtemp(prefix=".winscope-export-", dir=export_dir)
             archive_path = os.path.join(work_dir, "archive.zip")
