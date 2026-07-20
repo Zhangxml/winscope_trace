@@ -28,6 +28,15 @@ class WinscopeExportPageTest(unittest.TestCase):
         self.assertIn("'/devices'", self.page)
         self.assertIn("authorized === true", self.page)
 
+    def test_export_page_prefills_official_proxy_token(self):
+        self.assertIn('id="token" type="text"', self.page)
+        self.assertIn("localStorage.getItem('adb.proxyKey')", self.page)
+        self.assertIn("tokenInput.value", self.page)
+        self.assertRegex(
+            self.page,
+            r"try \{[\s\S]*localStorage\.getItem\('adb\.proxyKey'\)[\s\S]*\} catch \{")
+        self.assertNotIn("localStorage.setItem", self.page)
+
     def test_page_uses_strict_proxy_port_from_query_and_rejects_invalid_value(self):
         self.assertIn("new URLSearchParams(window.location.search)", self.page)
         self.assertIn("get('proxyPort')", self.page)

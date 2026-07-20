@@ -18,7 +18,7 @@
   <p>输入 Token 后即可导出最近一次 Winscope 抓取会话。</p>
   <form id="export-form">
     <label>Token
-      <input id="token" type="password" required autocomplete="off">
+      <input id="token" type="text" required autocomplete="off">
     </label>
     <div id="device-picker"></div>
     <button id="export-button" type="submit">导出并下载</button>
@@ -30,9 +30,16 @@
     const message = document.getElementById('message');
     const submitButton = document.getElementById('export-button');
     const devicePicker = document.getElementById('device-picker');
+    const tokenInput = document.getElementById('token');
     const proxyPort = new URLSearchParams(window.location.search).get('proxyPort');
     let exportInProgress = false;
     let deviceSelect = null;
+
+    try {
+      tokenInput.value = localStorage.getItem('adb.proxyKey') ?? '';
+    } catch {
+      // 浏览器禁用存储时保留手动输入。
+    }
 
     function showMessage(text) {
       message.textContent = text;
@@ -128,7 +135,7 @@
       if (exportInProgress || !proxyUrl) {
         return;
       }
-      const token = document.getElementById('token').value;
+      const token = tokenInput.value;
       if (!token) {
         showMessage('请输入 Token。');
         return;
