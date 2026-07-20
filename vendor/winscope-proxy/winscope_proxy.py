@@ -1105,6 +1105,8 @@ class RunAdbCmdEndpoint(DeviceRequestEndpoint):
         except AdbError as error:
             if self.is_optional_missing_find(cmd, error):
                 output = ""
+            elif self.is_screenrecord_version_probe(cmd, error):
+                output = str(error)
             else:
                 raise
         server.respond(HTTPStatus.OK, json.dumps(output).encode("utf-8"), "text/plain")
@@ -1119,6 +1121,13 @@ class RunAdbCmdEndpoint(DeviceRequestEndpoint):
             or normalized.startswith("shell su root find ")
         )
         return is_find and "No such file or directory" in str(error)
+
+    @staticmethod
+    def is_screenrecord_version_probe(command: str, error: AdbError) -> bool:
+        return (
+            command.strip() == "shell screenrecord --version"
+            and "screenrecord: unrecognized option `--version'" in str(error)
+        )
 
 
 class ADBWinscopeProxy(BaseHTTPRequestHandler):
