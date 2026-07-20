@@ -3,6 +3,7 @@
 
 import pathlib
 import re
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -64,6 +65,10 @@ class WinscopeExportPageTest(unittest.TestCase):
             r'install_root="\$\(cd -- "\$install_root" && pwd -P\)"')
 
     def test_webui_recovers_only_verified_winscope_loopback_listeners(self):
+        self.assertIn(
+            "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+            self.script,
+        )
         self.assertIn('ss -ltnp4 "sport = :$port"', self.script)
         self.assertIn('"/proc/${pid}/cmdline"', self.script)
         self.assertIn('[[ "${cmdline_args[1]}" == "-m" ]]', self.script)
@@ -94,6 +99,31 @@ class WinscopeExportPageTest(unittest.TestCase):
         self.assertRegex(
             self.script,
             r'\[\[ "\$ui_port" != "\$proxy_port" \]\] \|\| error "UI 与 Proxy 端口不能相同: \$ui_port"')
+
+    def test_port_probe_distinguishes_listener_from_reusable_closed_port(self):
+        probe_match = re.search(
+            r"is_port_free\(\) \{[\s\S]*?<<'PY'\n([\s\S]*?)\nPY\n\}",
+            self.script,
+        )
+        if probe_match is None:
+            self.fail('未找到 is_port_free 的 Python 探测代码')
+        probe = probe_match.group(1)
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(('127.0.0.1', 0))
+        port = listener.getsockname()[1]
+        listener.listen()
+        occupied = subprocess.run(['python3', '-', str(port)], input=probe, text=True)
+        self.assertEqual(occupied.returncode, 0)
+
+        client = socket.create_connection(('127.0.0.1', port))
+        connection, _ = listener.accept()
+        connection.close()
+        client.close()
+        listener.close()
+        reusable = subprocess.run(['python3', '-', str(port)], input=probe, text=True)
+        self.assertEqual(reusable.returncode, 1)
 
     def test_webui_cleanup_revalidates_owned_children_before_signals(self):
         self.assertIn('read_cmdline_args()', self.script)
